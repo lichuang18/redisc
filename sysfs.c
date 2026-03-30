@@ -18,6 +18,7 @@
 #include "segment.h"
 #include "gc.h"
 #include "iostat.h"
+#include "swod.h"
 #include <trace/events/f2fs.h>
 
 static struct proc_dir_entry *f2fs_proc_root;
@@ -248,7 +249,81 @@ static ssize_t main_blkaddr_show(struct f2fs_attr *a,
 	return snprintf(buf, PAGE_SIZE, "%llu\n",
 			(unsigned long long)MAIN_BLKADDR(sbi));
 }
+// swod start
+static ssize_t swod_held_groups_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%u\n", dcc->swod->nr_held_groups);
+}
+
+static ssize_t swod_hold_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->hold_cnt));
+}
+
+static ssize_t swod_skip_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_cnt));
+}
+
+static ssize_t swod_success_release_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(
+			&dcc->swod->success_release_cnt));
+}
+
+static ssize_t swod_timeout_release_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(
+			&dcc->swod->timeout_release_cnt));
+}
+
+static ssize_t swod_pressure_release_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(
+			&dcc->swod->pressure_release_cnt));
+}
+// swod over
 static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi, char *buf)
 {
@@ -445,6 +520,74 @@ out:
 		return count;
 	}
 
+	// swod start
+	if (!strcmp(a->attr.name, "swod_enable")) {
+		if (t > 1)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_win_segs")) {
+		if (t == 0 || t > SWOD_MAX_WIN_SEGS)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_qcov_thr_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_lres_thr_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_hold_min_ms")) {
+		if (t == 0 || t > UINT_MAX)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_hold_max_ms")) {
+		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+		if (t == 0 || t > UINT_MAX)
+			return -EINVAL;
+		if (dcc && t < dcc->swod_hold_min_ms)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_cmd_pressure")) {
+		if (t == 0 || t > UINT_MAX)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_blk_pressure")) {
+		if (t == 0 || t > UINT_MAX)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_max_held_groups")) {
+		if (t == 0 || t > UINT_MAX)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	// swod end
 	if (!strcmp(a->attr.name, "migration_granularity")) {
 		if (t == 0 || t > sbi->segs_per_sec)
 			return -EINVAL;
@@ -690,6 +833,17 @@ F2FS_RW_ATTR(F2FS_SBI, f2fs_sb_info, gc_urgent, gc_mode);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, reclaim_segments, rec_prefree_segments);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, max_small_discards, max_discards);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, discard_granularity, discard_granularity);
+// swod
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_enable, swod_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_win_segs, swod_win_segs);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_qcov_thr_bp, swod_qcov_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_lres_thr_bp, swod_lres_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_hold_min_ms, swod_hold_min_ms);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_hold_max_ms, swod_hold_max_ms);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_cmd_pressure, swod_cmd_pressure);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_blk_pressure, swod_blk_pressure);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_max_held_groups, swod_max_held_groups);
+
 F2FS_RW_ATTR(RESERVED_BLOCKS, f2fs_sb_info, reserved_blocks, reserved_blocks);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, batched_trim_sections, trim_sections);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, ipu_policy, ipu_policy);
@@ -736,6 +890,15 @@ F2FS_GENERAL_RO_ATTR(unusable);
 F2FS_GENERAL_RO_ATTR(encoding);
 F2FS_GENERAL_RO_ATTR(mounted_time_sec);
 F2FS_GENERAL_RO_ATTR(main_blkaddr);
+
+// swod
+F2FS_GENERAL_RO_ATTR(swod_held_groups);
+F2FS_GENERAL_RO_ATTR(swod_hold_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_cnt);
+F2FS_GENERAL_RO_ATTR(swod_success_release_cnt);
+F2FS_GENERAL_RO_ATTR(swod_timeout_release_cnt);
+F2FS_GENERAL_RO_ATTR(swod_pressure_release_cnt);
+
 #ifdef CONFIG_F2FS_STAT_FS
 F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, cp_foreground_calls, cp_count);
 F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, cp_background_calls, bg_cp_count);
@@ -867,6 +1030,24 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(seq_file_ra_mul),
 	ATTR_LIST(gc_segment_mode),
 	ATTR_LIST(gc_reclaimed_segments),
+	//swod
+	ATTR_LIST(swod_enable),
+	ATTR_LIST(swod_win_segs),
+	ATTR_LIST(swod_qcov_thr_bp),
+	ATTR_LIST(swod_lres_thr_bp),
+	ATTR_LIST(swod_hold_min_ms),
+	ATTR_LIST(swod_hold_max_ms),
+	ATTR_LIST(swod_cmd_pressure),
+	ATTR_LIST(swod_blk_pressure),
+	ATTR_LIST(swod_max_held_groups),
+
+	ATTR_LIST(swod_held_groups),
+	ATTR_LIST(swod_hold_cnt),
+	ATTR_LIST(swod_skip_cnt),
+	ATTR_LIST(swod_success_release_cnt),
+	ATTR_LIST(swod_timeout_release_cnt),
+	ATTR_LIST(swod_pressure_release_cnt),
+
 	NULL,
 };
 ATTRIBUTE_GROUPS(f2fs);

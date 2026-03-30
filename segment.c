@@ -22,6 +22,8 @@
 #include "gc.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
+#include "swod.h"
+
 
 #define __reverse_ffz(x) __reverse_ffs(~(x))
 
@@ -1022,6 +1024,7 @@ static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
 	dc->submit_time = 0;
 	dc->policy_type = -1;
 	dc->orig_len = 0;
+	dc->enq_jiffies = jiffies;   /* SWOD */
 	atomic_inc(&dcc->discard_cmd_cnt);
 	dcc->undiscard_blks += len;
 
@@ -1066,6 +1069,11 @@ static void __remove_discard_cmd(struct f2fs_sb_info *sbi,
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	unsigned long flags;
 
+	// 保留旧状态和旧范围
+	u8 old_state = dc->state;
+	block_t old_lstart = dc->lstart;
+	block_t old_len = dc->len;
+
 	trace_f2fs_remove_discard(dc->bdev, dc->start, dc->len);
 
 	spin_lock_irqsave(&dc->lock, flags);
@@ -1086,6 +1094,13 @@ static void __remove_discard_cmd(struct f2fs_sb_info *sbi,
 			KERN_INFO, sbi->sb->s_id,
 			dc->lstart, dc->start, dc->len, dc->error);
 	__detach_discard_cmd(dcc, dc);
+	
+	/*
+	 * 只有删掉的是 D_PREP 命令时，这次删除才改变了 SWOD
+	 * 所看到的 pending opportunity。
+	 */
+	if (old_state == D_PREP && old_len)
+		f2fs_swod_refresh_around_locked(sbi, old_lstart, old_len);
 }
 
 static void f2fs_submit_discard_endio(struct bio *bio)
@@ -1192,7 +1207,7 @@ static void __init_discard_policy(struct f2fs_sb_info *sbi,
 
 static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 				struct block_device *bdev, block_t lstart,
-				block_t start, block_t len);
+				block_t start, block_t len, bool swod_refresh);
 /* this function is copied from blkdev_issue_discard from block/blk-lib.c */
 static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
 						struct discard_policy *dpolicy,
@@ -1209,6 +1224,8 @@ static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
 	int flag = dpolicy->sync ? REQ_SYNC : 0;
 	block_t lstart, start, len, total_len;
 	int err = 0;
+	/* SWOD */  // 用以保存旧的D_PREP覆盖范围
+	block_t orig_lstart, orig_len;
 
 	if (dc->state != D_PREP)
 		return 0;
@@ -1218,6 +1235,10 @@ static int __submit_discard_cmd(struct f2fs_sb_info *sbi,
 
 	trace_f2fs_issue_discard(bdev, dc->start, dc->len);
 
+	// 记录旧范围
+	orig_lstart = dc->lstart;  /* SWOD */
+	orig_len = dc->len;  /* SWOD */
+	
 	lstart = dc->lstart;
 	start = dc->start;
 	len = dc->len;
@@ -1304,8 +1325,16 @@ submit:
 
 	if (!err && len) {
 		dcc->undiscard_blks -= len;
-		__update_discard_tree_range(sbi, bdev, lstart, start, len);
+		__update_discard_tree_range(sbi, bdev, lstart, start, len, false);
 	}
+	/*
+	* SWOD 关心的是“旧 D_PREP 机会最终变成了什么”：
+	* 可能是整条都离开 D_PREP，也可能是一部分离开、一部分 leftover 重新入队。
+	* 所以要在 submit 收尾后，对旧范围统一 refresh 一次。
+	*/
+	if (orig_len && dc->state != D_PREP)
+		f2fs_swod_refresh_around_locked(sbi, orig_lstart, orig_len);
+
 	return err;
 }
 
@@ -1345,6 +1374,7 @@ static void __punch_discard_cmd(struct f2fs_sb_info *sbi,
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct discard_info di = dc->di;
 	bool modified = false;
+	u8 old_state = dc->state;          /* SWOD */
 
 	if (dc->state == D_DONE || dc->len == 1) {
 		__remove_discard_cmd(sbi, dc);
@@ -1374,13 +1404,29 @@ static void __punch_discard_cmd(struct f2fs_sb_info *sbi,
 			__relocate_discard_cmd(dcc, dc);
 		}
 	}
+	/*
+	 * punch 改写了旧 D_PREP 可见范围，统一按旧范围 refresh 一次。
+	 * 这里只在 old_state == D_PREP 时做，避免对非 pending 态做无效刷新。
+	 */
+	if (old_state == D_PREP && di.len)
+		f2fs_swod_refresh_around_locked(sbi, di.lstart, di.len);
 }
 
+
+// 可能新建一个 cmd
+// 可能和前面合并
+// 可能和后面合并
+// 可能前后都合并
+// 可能多轮迭代才稳定
 static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 				struct block_device *bdev, block_t lstart,
-				block_t start, block_t len)
+				block_t start, block_t len, bool swod_refresh)
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	/* SWOD: 记录这次 tree update 原始影响范围 */
+	block_t orig_lstart = lstart;
+	block_t orig_len = len;
+
 	struct discard_cmd *prev_dc = NULL, *next_dc = NULL;
 	struct discard_cmd *dc;
 	struct discard_info di = {0};
@@ -1474,6 +1520,10 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 		node = rb_next(&prev_dc->rb_node);
 		next_dc = rb_entry_safe(node, struct discard_cmd, rb_node);
 	}
+
+	/* ---- SWOD hook: 只放在统一出口 ---- */
+	if (swod_refresh && orig_len)
+		f2fs_swod_refresh_around_locked(sbi, orig_lstart, orig_len);
 }
 
 static int __queue_discard_cmd(struct f2fs_sb_info *sbi,
@@ -1494,7 +1544,7 @@ static int __queue_discard_cmd(struct f2fs_sb_info *sbi,
 	}
 	mutex_lock(&SM_I(sbi)->dcc_info->cmd_lock);
 	before = dcc->undiscard_blks;
-	__update_discard_tree_range(sbi, bdev, lblkstart, blkstart, blklen);
+	__update_discard_tree_range(sbi, bdev, lblkstart, blkstart, blklen, true);
 	after = dcc->undiscard_blks;
 	mutex_unlock(&SM_I(sbi)->dcc_info->cmd_lock);
 	//lch
@@ -1533,6 +1583,18 @@ static unsigned int __issue_discard_cmd_orderly(struct f2fs_sb_info *sbi,
 
 		if (dc->state != D_PREP)
 			goto next;
+
+		/*
+		 * SWOD: 当前 cmd 落在 HELD window 内，且尚未到 release 条件，
+		 * 则先跳过，不提交。
+		 *
+		 * 这里必须推进 next_pos，避免下一轮 orderly scan
+		 * 又从同一个 held cmd 开始，造成空转。
+		 */
+		if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies)) {
+			dcc->next_pos = dc->lstart + dc->len;
+			goto next;
+		}
 
 		if (dpolicy->io_aware && !is_idle(sbi, DISCARD_TIME)) {
 			io_interrupted = true;
@@ -1612,6 +1674,15 @@ retry:
 			if (dpolicy->timeout &&
 				f2fs_time_over(sbi, UMOUNT_DISCARD_TIMEOUT))
 				break;
+			/*
+			 * SWOD: 若该 cmd 落在 HELD window 内且尚未到 release 条件，
+			 * 则本轮先跳过，不提交。
+			 *
+			 * list_for_each_entry_safe() 会自然继续扫描下一个节点，
+			 * 这里直接 continue 即可。
+			 */
+			if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies))
+				continue;
 
 			if (dpolicy->io_aware && i < dpolicy->io_aware_gran &&
 						!is_idle(sbi, DISCARD_TIME)) {
@@ -1823,7 +1894,12 @@ static int issue_discard_thread(void *data)
 		else
 			__init_discard_policy(sbi, &dpolicy, DPOLICY_BG,
 						dcc->discard_granularity);
-
+		
+		/* SWOD only works in normal background regime */
+		if (dpolicy.type != DPOLICY_BG ||
+		    dpolicy.granularity == 1)
+			f2fs_swod_release_all(sbi, SWOD_REL_PRESSURE);
+		
 		// pr_info("normal wait_ms: %u, cmd cnt: %u\n",wait_ms,atomic_read(&dcc->discard_cmd_cnt));		
 		if (!atomic_read(&dcc->discard_cmd_cnt)){
 		       wait_ms = dpolicy.max_interval;
@@ -2222,15 +2298,36 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 	dcc->root = RB_ROOT_CACHED;
 	dcc->rbtree_check = false;
 
+	dcc->swod_enable = 0;      /* 默认关闭，实验时再开 */
+	dcc->swod_win_segs = 0;    /* 让 swod_init 自动按 discard limit 推 */
+	dcc->swod_qcov_thr_bp = 8500;
+	dcc->swod_lres_thr_bp = 1000;
+	dcc->swod_hold_min_ms = 50;
+	dcc->swod_hold_max_ms = 300;
+	dcc->swod_cmd_pressure = 4096;
+	dcc->swod_blk_pressure = 1 << 20;
+	dcc->swod_max_held_groups = 64;
+	dcc->swod = NULL;
+
 	init_waitqueue_head(&dcc->discard_wait_queue);
 	SM_I(sbi)->dcc_info = dcc;
+	err = f2fs_swod_init(sbi);
+	if (err)
+		goto fail_swod;
 init_thread:
 	err = f2fs_start_discard_thread(sbi);
 	if (err) {
 		kfree(dcc);
 		SM_I(sbi)->dcc_info = NULL;
+		goto fail_thread;
 	}
+	return 0;
 
+fail_thread:
+	f2fs_swod_destroy(sbi);
+fail_swod:
+	kfree(dcc);
+	SM_I(sbi)->dcc_info = NULL;
 	return err;
 }
 
@@ -2250,6 +2347,7 @@ static void destroy_discard_cmd_control(struct f2fs_sb_info *sbi)
 	if (unlikely(atomic_read(&dcc->discard_cmd_cnt)))
 		f2fs_issue_discard_timeout(sbi);
 
+	f2fs_swod_destroy(sbi);
 	kfree(dcc);
 	SM_I(sbi)->dcc_info = NULL;
 }

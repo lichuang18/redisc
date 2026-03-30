@@ -357,6 +357,9 @@ struct discard_cmd {
 	u64 submit_time;		/* first bio submit time */
 	int policy_type;		/* discard policy type */
 	block_t orig_len;		/* original length for stats */
+	
+	/* SWOD: age source */
+	unsigned long enq_jiffies;
 };
 
 enum {
@@ -381,6 +384,8 @@ struct discard_policy {
 	unsigned int granularity;	/* discard granularity */
 };
 
+struct swod_ctrl;   /* forward declaration */
+
 struct discard_cmd_control {
 	struct task_struct *f2fs_issue_discard;	/* discard thread */
 	struct list_head entry_list;		/* 4KB discard entry list */
@@ -403,6 +408,19 @@ struct discard_cmd_control {
 	unsigned long long discard_both_merge_cnt;	/* # of both merges */
 	struct rb_root_cached root;		/* root of discard rb-tree */
 	bool rbtree_check;			/* config for consistence check */
+
+	/* ---------- SWOD tunables ---------- */
+	unsigned int swod_enable;              /* 0/1 */
+	unsigned int swod_win_segs;            /* group size in segments */
+	unsigned int swod_qcov_thr_bp;         /* 0..10000 */
+	unsigned int swod_lres_thr_bp;         /* 0..10000 */ // 万分比 9000标识0.9
+	unsigned int swod_hold_min_ms;
+	unsigned int swod_hold_max_ms;
+	unsigned int swod_cmd_pressure;        /* pending cmd threshold */
+	unsigned int swod_blk_pressure;        /* undiscard_blks threshold */
+	unsigned int swod_max_held_groups;     /* bound waiting scope */
+
+	struct swod_ctrl *swod;
 };
 
 /* for the list of fsync inodes, used only during recovery */
