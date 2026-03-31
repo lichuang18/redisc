@@ -1,0 +1,620 @@
+# SWOD 与动机二联合设计文档
+
+## 文档信息
+
+* 文档名称：SWOD 与动机二联合设计文档
+* 面向版本：Linux 5.15 / F2FS
+* 当前状态：SWOD 基础设计与实现思路已明确；动机二对接方案已完成设计，待实现
+* 文档用途：用于后续继续实现、论文撰写、实验规划与代码回溯
+
+---
+
+## 1. 背景与问题定义
+
+### 1.1 问题背景
+
+F2FS 是基于 LFS 的 flash-friendly 文件系统，其更新路径天然采用 out-of-place update。该机制虽然有利于顺序化写入，但会持续制造 obsolete/invalid blocks，并进一步引出 cleaning、metadata update 与 discard 等后续开销。
+
+现有 F2FS 的 discard 线程工作在空间回收链路的末端，其主要职责是消费已经形成的 pending discard 请求，而不是决定这些请求如何在更新过程中产生、如何在空间上组织、以及是否具有进一步合并的潜力。因此，仅围绕 discard issue thread 做参数调优，难以从根本上减少 backlog 的形成。
+
+与此同时，在真实更新负载中，大量 discard 请求往往呈现出小长度、高密度、局部相关的分布特征。若这些请求被过早发出，就会提前消耗掉未来可能成长为 segment-run discard 的局部机会。因此，系统需要一种机制：
+
+1. 识别哪些局部窗口值得先不发；
+2. 将这些窗口作为明确目标，优先减少其剩余 live blocks；
+3. 同时控制其他区域继续生成新的 partial-invalid segments。
+
+---
+
+## 2. 设计目标
+
+本文联合设计由两个层次组成：
+
+### 2.1 SWOD 的目标
+
+SWOD（Segment-Window Opportunity-aware Discard）用于解决动机一对应的问题：
+
+* 在现有 pending discard 队列之上识别“值得先不发”的局部 segment window；
+* 对这些窗口内部的小 discard 进行短暂 hold，而不是立即 issue；
+* 为后续补全机制留出时间，使这些窗口在后续 checkpoint / prefree / BG GC / 更新路径作用下，自然演化为更连续的 discard 候选。
+
+### 2.2 动机二对接机制的目标
+
+动机二的后续设计不再重新寻找机会窗口，而是直接消费 SWOD 已经识别并 hold 的窗口，目标包括：
+
+* 更快减少 held windows 中的 residual live blocks；
+* 尽量避免系统在其他区域继续制造新的 partial-invalid segments；
+* 最终使 held windows 更快 materialize 为连续 discard run，由 stock F2FS 自然发出。
+
+---
+
+## 3. 总体架构
+
+联合架构采用“先保留机会，再定向补全”的两段式闭环：
+
+```text
+pending discard
+     |
+     v
+SWOD selector
+(识别并 hold 住机会窗口)
+     |
+     v
+Completion Engine
+(优先补全 held windows 的残余 live blocks)
+     |
+     v
+Source-side Shaping
+(减少非目标区域继续产生新的 backlog)
+     |
+     v
+stock F2FS
+(checkpoint / prefree / issue_discard 自然发出更连续 discard)
+```
+
+在该架构中：
+
+* SWOD 是 selector，不直接负责“完成窗口”；
+* 动机二对应的 Completion Engine 和 Source-side Shaping 是 actuator，负责让窗口更快成熟；
+* 真正的 discard materialization 和发射仍然交给 stock F2FS 路径完成。
+
+---
+
+## 4. SWOD 设计（已完成）
+
+### 4.1 设计定位
+
+SWOD 不重写 F2FS 的 discard 框架，也不直接修改写入路径；它只在现有 pending discard 队列之上增加一个轻量的机会模型，用于回答：
+
+> 哪些局部 segment window 已经积累了足够高的 queue-visible discard，且仅剩少量 live blocks 尚未清除，因而值得先不发、保留未来的 segment-run 合并机会？
+
+SWOD 的动作是：
+
+* hold
+* skip
+* release
+
+SWOD **不是**一个“更激进地优先发长 discard”的调度器，也不会主动提交 materialized 大 discard。
+
+### 4.2 基本单位：segment group / window
+
+SWOD 的基本对象不是单条 discard command，而是由连续若干 segment 组成的 segment group。
+
+窗口大小记为：
+
+[
+W = \max\left(1,\ \min\left(W_{cap},\left\lfloor \frac{max_discard_bytes}{seg_bytes}\right\rfloor\right)\right)
+]
+
+其中：
+
+* (W)：窗口包含的 segment 数
+* (W_{cap})：实现上界
+* (max_discard_bytes)：块层允许的单次 discard 上限
+* (seg_bytes)：单个 F2FS segment 的字节数
+
+在 Linux 5.15 上，默认窗口大小通过 `request_queue->limits.max_discard_sectors` 与 `SEGMENT_SIZE(sbi)` 推导。
+
+### 4.3 轻量状态
+
+SWOD 维护以下状态：
+
+#### 4.3.1 per-segment 摘要
+
+每个 segment 对应一个 `swod_seg_hint`：
+
+* `pend_blks`：当前该 segment 内处于 `D_PREP` 且对 issue 可见的 pending discard blocks
+* `nr_cmds`：覆盖该 segment 的 pending discard 命令数量
+* `oldest_jiffies`：最早进入队列的 pending discard 时间
+
+#### 4.3.2 per-group 状态
+
+每个 group 对应一个 `swod_group_hint`：
+
+* `state`：`SWOD_G_NORMAL` / `SWOD_G_HELD`
+* `hold_off`：held 子窗口在 group 内的起始位置
+* `hold_len`：held 子窗口包含的连续段数
+* `hold_until`：等待截止时间
+* `last_eval`：最近一次评估时间
+
+#### 4.3.3 全局控制结构
+
+`swod_ctrl` 维护：
+
+* `nr_main_segs`
+* `win_segs`
+* `nr_groups`
+* `nr_held_groups`
+* `seg_hint[]`
+* `grp_hint[]`
+* `hold_segmap`
+* 统计项：`hold_cnt / skip_cnt / success_release_cnt / timeout_release_cnt / pressure_release_cnt`
+
+### 4.4 机会度量
+
+对于 group 内任意连续子窗口 (r)，定义：
+
+[
+C(r)=|r|\cdot B_{seg}
+]
+
+其中：
+
+* (|r|)：子窗口包含的 segment 数
+* (B_{seg})：单个 segment 的块容量
+
+进一步定义：
+
+[
+Q(r)=\sum pend_blks(i)
+]
+
+[
+L(r)=\sum valid_blks(i)
+]
+
+其中：
+
+* (Q(r))：窗口内已经显化为 queue-visible pending discard 的块数
+* (L(r))：窗口内当前仍然 live 的有效块数
+
+于是定义：
+
+[
+qcov(r)=\frac{Q(r)}{C(r)}
+]
+
+[
+lres(r)=\frac{L(r)}{C(r)}
+]
+
+其中：
+
+* `qcov(r)`：queue-visible coverage
+* `lres(r)`：live residual
+
+SWOD v1 不显式估计 latent invalid，而是通过 bounded waiting 在线吸收未来演化不确定性。
+
+### 4.5 hold 判定
+
+若窗口满足：
+
+[
+qcov(r)\ge T_q
+]
+
+[
+lres(r)\le T_l
+]
+
+则认为该窗口具有保留价值。
+
+其中：
+
+* (T_q)：queue-visible coverage 阈值，对应 `swod_qcov_thr_bp`
+* (T_l)：live residual 阈值，对应 `swod_lres_thr_bp`
+
+在多个候选中，优先级采用字典序：
+
+1. 连续 run 更长优先
+2. `lres` 更小优先
+3. `age` 更老优先
+
+### 4.6 bounded waiting
+
+窗口进入 HELD 后，不会无限等待，而采用有界等待：
+
+[
+H(r)\in [H_{min}, H_{max}]
+]
+
+其中：
+
+* `swod_hold_min_ms`
+* `swod_hold_max_ms`
+
+当前实现采用启发式规则：
+
+* run 越长，可适当多等
+* `qcov` 越高，可适当多等
+* `lres` 越低，可适当多等
+
+### 4.7 多窗口支持
+
+当前实现不是全局只有一个窗口，而是：
+
+* 每个 group 最多 hold 一个最佳子窗口
+* 多个 group 可以同时进入 HELD
+* 全局 held group 数量由 `swod_max_held_groups` 控制
+
+并发 held 窗口上限为：
+
+[
+N_{held}^{max}=\min(nr_{groups},\ swod_max_held_groups)
+]
+
+### 4.8 SWOD 当前职责
+
+SWOD 只做：
+
+* 识别机会窗口
+* hold 小 discard
+* skip issue
+* 在高压模式下 release/bypass
+
+SWOD 不做：
+
+* 直接发出大 discard
+* 直接指定 GC victim
+* 直接修改全局更新路径
+
+---
+
+## 5. 动机二对接设计（待实现）
+
+动机二的设计分为两个子层：
+
+### 5.1 子层 A：Window Completion Engine（WCE）
+
+目标：
+
+* 优先减少 held windows 中的 residual live blocks；
+* 让 held windows 更快从 near-ready 变成真正可 materialize 的连续 discard run。
+
+实现原则：
+
+* 只在 `BG_GC` 生效；
+* 只在非 urgent / 非 force 模式生效；
+* 不重写 stock F2FS cleaner，只做 bounded completion bonus。
+
+#### 5.1.1 SWOD 到 WCE 的接口
+
+SWOD 向 WCE 暴露 held windows：
+
+```c
+struct swod_target {
+    unsigned int first_segno;
+    unsigned int nr_segs;
+    unsigned int qcov_bp;
+    unsigned int lres_bp;
+    unsigned long hold_until;
+    unsigned long age_jiffies;
+};
+```
+
+配套接口：
+
+* `f2fs_swod_collect_targets()`
+* `f2fs_swod_seg_held(segno)`
+
+#### 5.1.2 completion gain
+
+对某个 BG GC victim segment (s)，定义：
+
+[
+gain(s)=\sum_{w\in\mathcal{W}} \mathbf{1}[s\in w]\cdot valid_blks(s)
+]
+
+其中：
+
+* (\mathcal{W})：当前 held windows 集合
+* (\mathbf{1}[s\in w])：若 victim 属于窗口 (w) 则为 1
+* `valid_blks(s)`：victim segment 中剩余有效块数
+
+更进一步，可按窗口残余规模归一化：
+
+[
+gain(s)=\sum_{w\in\mathcal{W}} \mathbf{1}[s\in w]\cdot \frac{valid_blks(s)}{residual_live(w)+1}
+]
+
+#### 5.1.3 与 stock GC 的结合方式
+
+WCE 不直接替换 stock GC cost，而采用：
+
+* 先按 stock F2FS 计算 `cost_stock(s)`；
+* 若多个候选 cost 足够接近，才使用 `gain(s)` 做 tie-break。
+
+即：
+
+* 主排序：stock GC cost
+* 次排序：completion gain
+
+这样保证：
+
+* 不破坏 cleaner 原有目标
+* 只在多候选接近时，偏向更有利于 held window completion 的 victim
+
+### 5.2 子层 B：Source-side Shaping（SSS）
+
+目标：
+
+* 让 held windows 更快完成；
+* 同时降低非目标区域新增 partial-invalid / discard backlog 的形成速度。
+
+关键思想：
+
+* **对 held windows 内部，应保持 OPU，而不是增强 IPU**；
+* **对 held windows 外部，应更积极利用现有 IPU/SSR 入口，减少新的分散失效。**
+
+#### 5.2.1 为什么目标窗口内应保持 OPU
+
+held windows 的目标是让其中剩余 live blocks 尽快消失。
+
+若某个旧块位于 held window 内：
+
+* 若未来更新采用 OPU，则新版本写到别处，旧位置在目标窗口内变 invalid；
+* 若采用 IPU，则旧位置被原地覆盖，反而继续保留“有效性”。
+
+因此，对 target zone 的策略应为：
+
+```text
+若旧块位于 held window 内 -> 禁止 IPU，保留 OPU
+```
+
+#### 5.2.2 为什么非目标区域应偏向 IPU/SSR
+
+SWOD 已经保住了少量有价值的窗口，此时系统应尽量避免在其他区域继续制造新的 partial-invalid segments。
+
+因此对 non-target zone：
+
+* 更积极利用现有 `IPU/SSR` 入口
+* 更少制造新的未来 discard demand
+
+#### 5.2.3 双区策略
+
+##### Target zone（held windows）
+
+目标：
+
+* 加速剩余 live blocks 消失
+
+策略：
+
+* 覆盖这些旧块的未来更新维持 OPU
+* 配合 WCE 的 BG GC completion bonus
+
+##### Non-target zone（其他区域）
+
+目标：
+
+* 尽量少制造新的 invalid blocks / partial-invalid segments
+
+策略：
+
+* 在存在 held windows 时，对非目标区域更积极地应用现有 IPU / SSR 策略
+
+---
+
+## 6. 联合状态机
+
+联合设计的完整状态链如下：
+
+```text
+NORMAL
+  |
+  |  SWOD 识别高 qcov + 低 lres 窗口
+  v
+HELD
+  |
+  |  WCE 通过 BG GC completion bonus 减少 residual live
+  |  SSS 在 target zone 保持 OPU，在 non-target zone 减少新增 invalid
+  v
+NEAR-COMPLETE
+  |
+  |  residual live -> 0
+  v
+READY-FOR-MATERIALIZATION
+  |
+  |  checkpoint / prefree / stock issue path
+  v
+MATERIALIZED DISCARD RUN
+  |
+  v
+ISSUED BY STOCK F2FS
+```
+
+其中：
+
+* SWOD 不直接发出大 discard
+* WCE/SSS 也不直接伪造新的大 discard
+* 真正的 materialization 仍交给 stock F2FS 完成
+
+---
+
+## 7. 代码落点设计
+
+### 7.1 已完成：SWOD 实现落点
+
+* `fs/f2fs/f2fs.h`
+
+  * `discard_cmd` 增加 `enq_jiffies`
+  * `discard_cmd_control` 增加 SWOD tunable 与 `swod_ctrl *`
+* `fs/f2fs/swod.h`
+
+  * 定义 SWOD 结构与接口
+* `fs/f2fs/swod.c`
+
+  * 实现窗口评估、状态机、hold/skip/release
+* `fs/f2fs/segment.c`
+
+  * 在 queue / submit / punch / remove / issue 路径上加 hook
+* `fs/f2fs/sysfs.c`
+
+  * 暴露 SWOD 参数与统计
+
+### 7.2 待实现：WCE 落点
+
+推荐落点：
+
+* `fs/f2fs/gc.c`
+
+  * 在 BG GC victim selection 处引入 bounded completion tie-break
+* `fs/f2fs/swod.c`
+
+  * 提供 `collect_targets()` / `seg_held()` 等查询接口
+
+### 7.3 待实现：SSS 落点
+
+推荐落点：
+
+* 写路径中最终决定 `IPU/OPU` 的判定点
+
+  * 若旧块位于 held window，则禁止 IPU
+* SSR 触发条件的运行时偏置点
+
+  * 当系统存在 held windows 时，对 non-target zone 略微提早 SSR
+
+---
+
+## 8. 参数设计
+
+### 8.1 SWOD 已有参数
+
+* `swod_enable`
+* `swod_win_segs`
+* `swod_qcov_thr_bp`
+* `swod_lres_thr_bp`
+* `swod_hold_min_ms`
+* `swod_hold_max_ms`
+* `swod_cmd_pressure`
+* `swod_blk_pressure`
+* `swod_max_held_groups`
+
+### 8.2 WCE 新增参数（建议）
+
+* `swod_completion_enable`
+* `swod_gc_bonus_enable`
+* `swod_gc_tie_margin`
+* `swod_gc_bonus_max`
+
+### 8.3 SSS 新增参数（建议）
+
+* `swod_shaping_enable`
+* `swod_target_keep_opu`
+* `swod_nontarget_ipu_bias_util`
+* `swod_nontarget_ssr_bias_secs`
+
+---
+
+## 9. 实现顺序建议
+
+为了降低复杂度并保持论文结构清晰，推荐按以下顺序实现：
+
+### 第一步：完成 SWOD（已完成）
+
+目标：
+
+* 证明系统能够识别并 hold 值得保留的窗口
+* 证明 issue 路径能对 held cmd 实现 skip
+
+### 第二步：实现 WCE
+
+目标：
+
+* 证明 BG GC 可以帮助减少 held windows 的 residual live blocks
+* 形成 `SWOD + completion-aware BG GC` 的最小闭环
+
+### 第三步：实现 SSS 的第一条规则
+
+目标：
+
+* 对 held windows 内的更新保持 OPU
+* 加速 held windows 的旧位置失效
+
+### 第四步：实现 SSS 的第二条规则
+
+目标：
+
+* 对 held windows 外部更积极应用现有 IPU / SSR
+* 降低系统新增 backlog 的形成速度
+
+---
+
+## 10. 实验与消融建议
+
+建议按下列组别做消融：
+
+1. **stock F2FS**
+2. **SWOD-hold-only**
+3. **SWOD + WCE**
+4. **SWOD + SSS(target keep OPU)**
+5. **SWOD + WCE + SSS**
+
+重点观察：
+
+* `swod_hold_cnt`
+* `swod_skip_cnt`
+* `swod_held_groups`
+* `swod_success_release_cnt`
+* `pending_discard`
+* `issued_discard`
+* `undiscard_blks`
+* `gc_background_calls`
+* `moved_blocks_background`
+* `avg_vblocks`
+
+同时在 micro（fio）与 macro（tpcc/MySQL）两类负载下都做验证。
+
+---
+
+## 11. 当前已完成 / 待完成清单
+
+### 已完成
+
+* SWOD 设计完成
+* SWOD 轻量状态机完成
+* SWOD issue skip 逻辑完成
+* SWOD sysfs 接口完成
+* SWOD 多窗口（多 group 并发 held）语义已明确
+
+### 待完成
+
+* SWOD 到 WCE 的目标接口
+* BG GC completion bonus
+* target zone keep-OPU 规则
+* non-target zone IPU/SSR bias
+* 联合实验与消融评估
+
+---
+
+## 12. 后续继续开发时的建议
+
+下次继续时，建议优先做如下工作：
+
+1. 在 `swod.c` 中增加 `f2fs_swod_collect_targets()`
+2. 在 `gc.c` 中加一个最小的 `swod_completion_better()`
+3. 先只做 BG_GC + 非 urgent 模式下的 tie-break
+4. 验证 held windows 的 `lres` 是否下降更快
+5. 再接 target-zone keep-OPU 规则
+
+如此可以保证每一步都是独立可验证、可消融、可回滚的。
+
+---
+
+## 13. 一句话总结
+
+SWOD 与动机二的联合设计，不是让系统“更激进地发出 discard”，而是：
+
+> **先识别并保留局部未来可合并机会，再围绕这些 held windows 定向减少其残余 live blocks，并尽量在其他区域少制造新的 backlog，最终由 stock F2FS 自然 materialize 成更连续的 discard run。**
+
+这就是整个设计的核心闭环。
+
