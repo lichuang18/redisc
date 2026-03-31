@@ -421,6 +421,11 @@ struct discard_cmd_control {
 	unsigned int swod_max_held_groups;     /* bound waiting scope */
 
 	struct swod_ctrl *swod;
+	
+	/* ---------- WCE tunables ---------- */
+	unsigned int swod_completion_enable;   /* 0/1 */
+	unsigned int swod_gc_bg_enable;        /* 0/1 */
+	unsigned int swod_gc_fg_enable;        /* 0/1 */
 };
 
 /* for the list of fsync inodes, used only during recovery */

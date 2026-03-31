@@ -4,7 +4,7 @@
 
 * 文档名称：SWOD 与动机二联合设计文档
 * 面向版本：Linux 5.15 / F2FS
-* 当前状态：SWOD 基础设计与实现思路已明确；动机二对接方案已完成设计，待实现
+* 当前状态：SWOD 已实现；动机二已完成第一版 target-first WCE，实现了围绕 held windows 的 GC 定向补全最小闭环；SSS 尚未实现
 * 文档用途：用于后续继续实现、论文撰写、实验规划与代码回溯
 
 ---
@@ -280,15 +280,15 @@ SWOD 不做：
 * 优先减少 held windows 中的 residual live blocks；
 * 让 held windows 更快从 near-ready 变成真正可 materialize 的连续 discard run。
 
-实现原则：
+#### 5.1.1 原始设想
 
-* 只在 `BG_GC` 生效；
+最初设计中，WCE 的原则是：
+
+* 优先放在 `BG_GC` 生效；
 * 只在非 urgent / 非 force 模式生效；
-* 不重写 stock F2FS cleaner，只做 bounded completion bonus。
+* 不重写 stock F2FS cleaner，只做 bounded completion bonus / tie-break。
 
-#### 5.1.1 SWOD 到 WCE 的接口
-
-SWOD 向 WCE 暴露 held windows：
+对应原始接口与度量设想包括：
 
 ```c
 struct swod_target {
@@ -301,47 +301,72 @@ struct swod_target {
 };
 ```
 
-配套接口：
+以及：
 
 * `f2fs_swod_collect_targets()`
-* `f2fs_swod_seg_held(segno)`
+* `completion gain(s)`
+* `cost_stock(s) + gain(s)` 的 bounded tie-break 结合方式
 
-#### 5.1.2 completion gain
+这套方案的优点是偏置更软、更贴近 stock cleaner，但实现复杂度更高。
 
-对某个 BG GC victim segment (s)，定义：
+#### 5.1.2 当前已实现版本：target-first WCE
 
-[
-gain(s)=\sum_{w\in\mathcal{W}} \mathbf{1}[s\in w]\cdot valid_blks(s)
-]
+当前代码落地的不是上述软偏置方案，而是一个更直接的 **target-first WCE**。
 
-其中：
+其核心语义是：
 
-* (\mathcal{W})：当前 held windows 集合
-* (\mathbf{1}[s\in w])：若 victim 属于窗口 (w) 则为 1
-* `valid_blks(s)`：victim segment 中剩余有效块数
+* 只要当前 SWOD 仍有 held windows；
+* 且 GC 处于允许 WCE 生效的模式；
+* victim selection 就先只在 held target 覆盖到的段 / section 中寻找合法 victim；
+* 若这轮 target pass 完全找不到合法 victim，再一次性回退到 stock F2FS 的全局选择。
 
-更进一步，可按窗口残余规模归一化：
+换句话说，当前版本不是通过 `gain(s)` 对所有候选做排序微调，而是：
 
-[
-gain(s)=\sum_{w\in\mathcal{W}} \mathbf{1}[s\in w]\cdot \frac{valid_blks(s)}{residual_live(w)+1}
-]
+> **先把 SWOD already-held windows 作为 GC 的优先目标集；在目标集内部仍沿用 stock F2FS 的合法性检查与 cost 选择。**
 
-#### 5.1.3 与 stock GC 的结合方式
+#### 5.1.3 当前版本为什么采用 target-first
 
-WCE 不直接替换 stock GC cost，而采用：
+原因主要有三点：
 
-* 先按 stock F2FS 计算 `cost_stock(s)`；
-* 若多个候选 cost 足够接近，才使用 `gain(s)` 做 tie-break。
+1. SWOD 已经维护了 `hold_segmap`，天然提供了“哪些 segment 当前属于 held window”的快速目标接口；
+2. 基于 `hold_segmap` 增加一个 target-first 筛选层，改动最小，能最快形成 `SWOD -> GC completion -> stock materialization` 的最小闭环；
+3. 这更贴合当前实现阶段的硬约束：**窗口中还有 segment，就优先从这里选 victim。**
 
-即：
+因此，当前版本没有先实现：
 
-* 主排序：stock GC cost
-* 次排序：completion gain
+* `f2fs_swod_collect_targets()`
+* `gain(s)`
+* `tie_margin`
+* `bonus_max`
 
-这样保证：
+而是先走一条更直接、更容易验证的路径。
 
-* 不破坏 cleaner 原有目标
-* 只在多候选接近时，偏向更有利于 held window completion 的 victim
+#### 5.1.4 当前代码中的 SWOD -> WCE 接口
+
+当前代码通过以下接口向 WCE 暴露 held target set：
+
+* `f2fs_swod_has_held()`
+* `f2fs_swod_range_held()`
+* `f2fs_swod_seg_held()`
+
+其中核心接口是 `f2fs_swod_range_held()`：
+
+* 只要某个 victim range 与 held bitmap 有交集，就认为该 range 命中 held target set；
+* 当前仍是基于 `hold_segmap` 的轻量 range 命中判断，而不是基于 per-window residual live / qcov / age 的细粒度 completion score。
+
+#### 5.1.5 当前与 stock GC 的结合方式
+
+当前版本与 stock GC 的结合方式为：
+
+* target pass：先只在 held target set 中选；
+* target set 内部：仍按 stock F2FS 的合法性检查与原始 cost 选择；
+* 若 target pass 没选到合法 victim：fallback 一次，退回 stock picker。
+
+因此它的定位是：
+
+* **不是重写 cleaner cost model**；
+* **不是主动发明新的大 discard**；
+* **只是把 SWOD 保住的窗口转化为 GC 的优先目标集。**
 
 ### 5.2 子层 B：Source-side Shaping（SSS）
 
@@ -461,16 +486,27 @@ ISSUED BY STOCK F2FS
 
   * 暴露 SWOD 参数与统计
 
-### 7.2 待实现：WCE 落点
+### 7.2 已完成 / 待扩展：WCE 落点
 
-推荐落点：
+当前已完成的落点：
 
 * `fs/f2fs/gc.c`
 
-  * 在 BG GC victim selection 处引入 bounded completion tie-break
+  * 已在 victim selection 中接入 target-first WCE
+  * 已支持 held-target-first pass + stock fallback
+  * 已支持 BG / FG 的独立开关与统计
 * `fs/f2fs/swod.c`
 
-  * 提供 `collect_targets()` / `seg_held()` 等查询接口
+  * 已提供 `has_held()` / `range_held()` / `seg_held()` 查询接口
+
+后续若要继续扩展为原始软偏置版本，推荐补充：
+
+* `fs/f2fs/gc.c`
+
+  * 在 BG GC victim selection 处引入 bounded completion tie-break / gain(s)
+* `fs/f2fs/swod.c`
+
+  * 提供 `collect_targets()` 或更细粒度的 per-window target descriptor
 
 ### 7.3 待实现：SSS 落点
 
@@ -499,10 +535,16 @@ ISSUED BY STOCK F2FS
 * `swod_blk_pressure`
 * `swod_max_held_groups`
 
-### 8.2 WCE 新增参数（建议）
+### 8.2 WCE 参数
+
+当前已实现：
 
 * `swod_completion_enable`
-* `swod_gc_bonus_enable`
+* `swod_gc_bg_enable`
+* `swod_gc_fg_enable`
+
+若后续继续扩展为原始 bonus / tie-break 版本，可再增加：
+
 * `swod_gc_tie_margin`
 * `swod_gc_bonus_max`
 
@@ -526,12 +568,18 @@ ISSUED BY STOCK F2FS
 * 证明系统能够识别并 hold 值得保留的窗口
 * 证明 issue 路径能对 held cmd 实现 skip
 
-### 第二步：实现 WCE
+### 第二步：实现 WCE（已完成第一版）
 
-目标：
+当前已完成：
 
-* 证明 BG GC 可以帮助减少 held windows 的 residual live blocks
-* 形成 `SWOD + completion-aware BG GC` 的最小闭环
+* 已实现 `SWOD + target-first GC selection` 的最小闭环
+* 已能在 held windows 存在时，优先围绕目标段做 victim selection
+* 已保留 stock fallback，避免目标集中无合法 victim 时阻塞 GC
+
+仍待扩展：
+
+* 是否需要进一步演进到 `gain(s)` / tie-break 版本，待实验后决定
+* 若保留 target-first 作为主方案，可继续做更细粒度 target score / target range 过滤
 
 ### 第三步：实现 SSS 的第一条规则
 
@@ -585,11 +633,14 @@ ISSUED BY STOCK F2FS
 * SWOD issue skip 逻辑完成
 * SWOD sysfs 接口完成
 * SWOD 多窗口（多 group 并发 held）语义已明确
+* SWOD 到 WCE 的 held-target 查询接口已完成
+* 第一版 WCE 已完成：target-first victim selection + stock fallback
+* WCE 的 sysfs 开关与 pick/fallback 统计已完成
 
 ### 待完成
 
-* SWOD 到 WCE 的目标接口
-* BG GC completion bonus
+* 验证 target-first WCE 的收益、代价与 fallback 频率
+* 视实验结果决定是否继续实现 `gain(s)` / tie-break 软偏置版本
 * target zone keep-OPU 规则
 * non-target zone IPU/SSR bias
 * 联合实验与消融评估
@@ -600,13 +651,19 @@ ISSUED BY STOCK F2FS
 
 下次继续时，建议优先做如下工作：
 
-1. 在 `swod.c` 中增加 `f2fs_swod_collect_targets()`
-2. 在 `gc.c` 中加一个最小的 `swod_completion_better()`
-3. 先只做 BG_GC + 非 urgent 模式下的 tie-break
-4. 验证 held windows 的 `lres` 是否下降更快
-5. 再接 target-zone keep-OPU 规则
+1. 先基于当前代码验证 target-first WCE：
+   * `swod_gc_pick_bg_cnt`
+   * `swod_gc_pick_fg_cnt`
+   * `swod_gc_fallback_cnt`
+   * held windows 的 `lres` 是否下降更快
+2. 判断 target-first 是否已经足够：
+   * 若收益明显且副作用可接受，可保留为主方案并继续做 SSS；
+   * 若偏置过强或 fallback 过多，再补 `gain(s)` / tie-break 版本
+3. 优先接入 target-zone keep-OPU 规则
+4. 再接 non-target IPU / SSR bias
+5. 最后补联合实验与消融
 
-如此可以保证每一步都是独立可验证、可消融、可回滚的。
+如此可以保证下一步仍然是独立可验证、可消融、可回滚的。
 
 ---
 

@@ -2307,6 +2307,10 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 	dcc->swod_cmd_pressure = 4096;
 	dcc->swod_blk_pressure = 1 << 20;
 	dcc->swod_max_held_groups = 64;
+
+	dcc->swod_completion_enable = 0;
+	dcc->swod_gc_bg_enable = 1;
+	dcc->swod_gc_fg_enable = 1;
 	dcc->swod = NULL;
 
 	init_waitqueue_head(&dcc->discard_wait_queue);

@@ -324,6 +324,43 @@ static ssize_t swod_pressure_release_cnt_show(struct f2fs_attr *a,
 			&dcc->swod->pressure_release_cnt));
 }
 // swod over
+// wce start
+static ssize_t swod_gc_pick_bg_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->gc_pick_bg_cnt));
+}
+
+static ssize_t swod_gc_pick_fg_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->gc_pick_fg_cnt));
+}
+
+static ssize_t swod_gc_fallback_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->gc_fallback_cnt));
+}
+// wce over
 static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi, char *buf)
 {
@@ -588,6 +625,18 @@ out:
 		return count;
 	}
 	// swod end
+	// wce start
+	if (!strcmp(a->attr.name, "swod_completion_enable") ||
+	    !strcmp(a->attr.name, "swod_gc_bg_enable") ||
+	    !strcmp(a->attr.name, "swod_gc_fg_enable")) {
+		if (t > 1)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	// wce over
+
+
 	if (!strcmp(a->attr.name, "migration_granularity")) {
 		if (t == 0 || t > sbi->segs_per_sec)
 			return -EINVAL;
@@ -844,6 +893,14 @@ F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_cmd_pressure, swod_cmd_pressure
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_blk_pressure, swod_blk_pressure);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_max_held_groups, swod_max_held_groups);
 
+// wce
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_completion_enable, swod_completion_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_gc_bg_enable, swod_gc_bg_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_gc_fg_enable, swod_gc_fg_enable);
+
 F2FS_RW_ATTR(RESERVED_BLOCKS, f2fs_sb_info, reserved_blocks, reserved_blocks);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, batched_trim_sections, trim_sections);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, ipu_policy, ipu_policy);
@@ -898,6 +955,12 @@ F2FS_GENERAL_RO_ATTR(swod_skip_cnt);
 F2FS_GENERAL_RO_ATTR(swod_success_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_timeout_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_pressure_release_cnt);
+
+// wce
+F2FS_GENERAL_RO_ATTR(swod_gc_pick_bg_cnt);
+F2FS_GENERAL_RO_ATTR(swod_gc_pick_fg_cnt);
+F2FS_GENERAL_RO_ATTR(swod_gc_fallback_cnt);
+
 
 #ifdef CONFIG_F2FS_STAT_FS
 F2FS_STAT_ATTR(STAT_INFO, f2fs_stat_info, cp_foreground_calls, cp_count);
@@ -1047,7 +1110,15 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_success_release_cnt),
 	ATTR_LIST(swod_timeout_release_cnt),
 	ATTR_LIST(swod_pressure_release_cnt),
-
+	
+	// wce
+	ATTR_LIST(swod_completion_enable),
+	ATTR_LIST(swod_gc_bg_enable),
+	ATTR_LIST(swod_gc_fg_enable),
+	ATTR_LIST(swod_gc_pick_bg_cnt),
+	ATTR_LIST(swod_gc_pick_fg_cnt),
+	ATTR_LIST(swod_gc_fallback_cnt),
+	
 	NULL,
 };
 ATTRIBUTE_GROUPS(f2fs);

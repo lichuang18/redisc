@@ -19,6 +19,7 @@
 #include "node.h"
 #include "segment.h"
 #include "gc.h"
+#include "swod.h"
 #include "iostat.h"
 #include <trace/events/f2fs.h>
 
@@ -350,6 +351,48 @@ static inline unsigned int get_gc_cost(struct f2fs_sb_info *sbi,
 	f2fs_bug_on(sbi, 1);
 	return 0;
 }
+// wce start
+static inline bool swod_wce_enabled(struct f2fs_sb_info *sbi, int gc_type)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return false;
+	if (!dcc->swod_enable || !dcc->swod_completion_enable)
+		return false;
+
+	if (gc_type == BG_GC)
+		return !!dcc->swod_gc_bg_enable;
+
+	if (gc_type == FG_GC) {
+		if (sbi->gc_mode == GC_URGENT_HIGH)
+			return false;
+		return !!dcc->swod_gc_fg_enable;
+	}
+
+	return false;
+}
+
+static inline bool swod_wce_match(struct f2fs_sb_info *sbi,
+				  unsigned int segno,
+				  unsigned int nr_segs)
+{
+	return f2fs_swod_range_held(sbi, segno, nr_segs);
+}
+
+static inline void swod_wce_account_pick(struct f2fs_sb_info *sbi, int gc_type)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return;
+
+	if (gc_type == BG_GC)
+		atomic64_inc(&dcc->swod->gc_pick_bg_cnt);
+	else if (gc_type == FG_GC)
+		atomic64_inc(&dcc->swod->gc_pick_fg_cnt);
+}
+// wce over
 
 static unsigned int count_bits(const unsigned long *addr,
 				unsigned int offset, unsigned int len)
@@ -646,6 +689,7 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	unsigned int last_segment;
 	unsigned int nsearched;
 	bool is_atgc;
+	bool swod_target_pass;
 	int ret = 0;
 
 	mutex_lock(&dirty_i->seglist_lock);
@@ -654,6 +698,10 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	p.alloc_mode = alloc_mode;
 	p.age = age;
 	p.age_threshold = sbi->am.age_threshold;
+	// wce入口条件 
+	swod_target_pass = (alloc_mode == LFS) &&
+			swod_wce_enabled(sbi, gc_type) &&
+			f2fs_swod_has_held(sbi);
 
 retry:
 	select_policy(sbi, gc_type, type, &p);
@@ -685,14 +733,21 @@ retry:
 		goto out;
 
 	if (__is_large_section(sbi) && p.alloc_mode == LFS) {
-		if (sbi->next_victim_seg[BG_GC] != NULL_SEGNO) {
+		if (sbi->next_victim_seg[BG_GC] != NULL_SEGNO &&
+		    (!swod_target_pass ||
+		     swod_wce_match(sbi, sbi->next_victim_seg[BG_GC],
+				    p.ofs_unit))) {
 			p.min_segno = sbi->next_victim_seg[BG_GC];
 			*result = p.min_segno;
 			sbi->next_victim_seg[BG_GC] = NULL_SEGNO;
 			goto got_result;
 		}
+
 		if (gc_type == FG_GC &&
-				sbi->next_victim_seg[FG_GC] != NULL_SEGNO) {
+		    sbi->next_victim_seg[FG_GC] != NULL_SEGNO &&
+		    (!swod_target_pass ||
+		     swod_wce_match(sbi, sbi->next_victim_seg[FG_GC],
+				    p.ofs_unit))) {
 			p.min_segno = sbi->next_victim_seg[FG_GC];
 			*result = p.min_segno;
 			sbi->next_victim_seg[FG_GC] = NULL_SEGNO;
@@ -703,8 +758,12 @@ retry:
 	last_victim = sm->last_victim[p.gc_mode];
 	if (p.alloc_mode == LFS && gc_type == FG_GC) {
 		p.min_segno = check_bg_victims(sbi);
-		if (p.min_segno != NULL_SEGNO)
-			goto got_it;
+		if (p.min_segno != NULL_SEGNO) {
+			if (!swod_target_pass ||
+			    swod_wce_match(sbi, p.min_segno, p.ofs_unit))
+				goto got_it;
+			p.min_segno = NULL_SEGNO;
+		}
 	}
 
 	while (1) {
@@ -768,6 +827,10 @@ retry:
 		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
 			goto next;
 
+		if (swod_target_pass &&
+		    !swod_wce_match(sbi, segno, p.ofs_unit))
+			goto next;
+
 		if (is_atgc) {
 			add_victim_entry(sbi, &p, segno);
 			goto next;
@@ -803,11 +866,27 @@ next:
 		p.age_threshold = 0;
 		goto retry;
 	}
+	/* 
+	第一次扫描：只看 held-window 目标集；
+	如果目标集里一个合法 victim 都没有：回退到 stock picker；
+	只回退一次，不搞多轮复杂状态机。
+	*/
+	if (p.min_segno == NULL_SEGNO && swod_target_pass) {
+		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+		swod_target_pass = false;
+		if (dcc && dcc->swod)
+			atomic64_inc(&dcc->swod->gc_fallback_cnt);
+		goto retry;
+	}
 
 	if (p.min_segno != NULL_SEGNO) {
 got_it:
 		*result = (p.min_segno / p.ofs_unit) * p.ofs_unit;
 got_result:
+		if (swod_target_pass)
+			swod_wce_account_pick(sbi, gc_type);
+			
 		if (p.alloc_mode == LFS) {
 			secno = GET_SEC_FROM_SEG(sbi, p.min_segno);
 			if (gc_type == FG_GC)

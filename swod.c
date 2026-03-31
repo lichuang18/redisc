@@ -587,14 +587,61 @@ void f2fs_swod_release_all(struct f2fs_sb_info *sbi,
 	mutex_unlock(&dcc->cmd_lock);
 }
 
-bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
+// bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
+// {
+// 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+// 	if (!swod_enabled(dcc))
+// 		return false;
+// 	if (segno >= dcc->swod->nr_main_segs)
+// 		return false;
+
+// 	return test_bit(segno, dcc->swod->hold_segmap);
+// }
+
+
+
+/*
+ * GC-side WCE lookup is advisory only, so lockless bitmap reads are enough.
+ * Races only change the bias of victim selection and will fall back to the
+ * stock picker when no target survives the normal GC checks.
+ */
+bool f2fs_swod_has_held(struct f2fs_sb_info *sbi)
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 
 	if (!swod_enabled(dcc))
 		return false;
-	if (segno >= dcc->swod->nr_main_segs)
+
+	return !!READ_ONCE(dcc->swod->nr_held_groups);
+}
+
+bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
+			  unsigned int nr_segs)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int end;
+
+	if (!swod_enabled(dcc))
 		return false;
 
-	return test_bit(segno, dcc->swod->hold_segmap);
+	sw = dcc->swod;
+	if (!nr_segs || segno >= sw->nr_main_segs)
+		return false;
+	if (!READ_ONCE(sw->nr_held_groups))
+		return false;
+
+	end = min(sw->nr_main_segs, segno + nr_segs);
+	for (; segno < end; segno++) {
+		if (test_bit(segno, sw->hold_segmap))
+			return true;
+	}
+
+	return false;
+}
+
+bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	return f2fs_swod_range_held(sbi, segno, 1);
 }

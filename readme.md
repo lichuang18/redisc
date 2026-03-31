@@ -18,24 +18,35 @@ SWOD 的设计初衷如下：
 
 ## 2. 设计目标
 
+当前代码已经形成两层协同：
+
+1. **SWOD**：在 pending discard 队列之上识别并 hold 值得保留的窗口；
+2. **WCE（本版）**：把 SWOD 已经 hold 的窗口当成 GC 的优先目标集，优先减少其中的 residual live blocks。
+
 SWOD 只解决以下问题：
 
 > 对于已经进入 pending discard 队列的小 discard 请求，哪些局部 segment window 更值得**先不发**，从而为后续补全整段/连续段创造条件？
 
-SWOD **不负责**：
+本版 WCE 解决的问题是：
+
+> 当 SWOD 已经保住一些 held windows 之后，如何让 GC 优先围绕这些目标段工作，使窗口更快成熟？
+
+SWOD / WCE **都不负责**：
 
 - 直接重写 `ipu_policy`
 - 直接修改 `alloc_mode`
 - 直接修改 SSR 提前触发阈值
 - 直接重排前台写入落点
 - 直接将 held 窗口强行转化为大 discard 并立即发出
+- 主动伪造新的大 discard run
 
-因此，SWOD 的职责是：
+因此，当前版本的职责是：
 
 1. **识别机会窗口**
 2. **暂缓发射（hold）**
 3. **在系统高压时及时让路**
-4. **为后续补全机制暴露“哪里值得优先补全”的目标**
+4. **向 WCE 暴露“哪里值得优先补全”的 held target set**
+5. **在 GC 侧优先清理 held windows 中仍残留 live blocks 的段**
 
 ---
 
@@ -256,7 +267,55 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 ---
 
-## 5. 代码改动概述
+## 5. Target-first WCE（本版新增）
+
+### 5.1 设计定位
+
+这版 WCE 不是仓库文档里最初设想的“BG_GC 上做 bounded completion bonus / tie-break”的软偏置版本，而是一个更直接的 **target-first WCE**：
+
+- 只要当前 SWOD 维护的 held windows 还存在；
+- 且 GC 工作在允许 WCE 的模式下；
+- victim 选择就先只在这些 held target 覆盖到的 segment / section 中进行；
+- 如果这一轮完全找不到合法 victim，再一次性回退到 stock F2FS 的全局选择。
+
+换句话说，本版 WCE 的核心不是重写 cleaner 成本模型，而是给 stock victim picker 外面套一层 **held-target-first filter**。
+
+### 5.2 为什么采用 target-first
+
+当前代码里，SWOD 已经维护了 `hold_segmap`，并且能够快速回答：
+
+- 当前是否还有 held windows；
+- 某个 `segno` 是否落在 held window 内；
+- 某个 victim range 是否与 held window 有交集。
+
+基于这条现成接口，实现一个最小闭环的方式就是：
+
+- 让 GC 先只看 held target set；
+- 在目标集内部仍沿用 stock F2FS 的合法性检查与 cost 选择；
+- 若目标集中没有合法 victim，再退回 stock picker。
+
+这样做的优点是：
+
+- 不必先实现 `collect_targets()` / `gain(s)` / `tie_margin` / `bonus_max` 那整套软偏置模型；
+- 与当前 SWOD 的 held bitmap 接口天然对接；
+- 改动集中在 victim selection 路径，验证成本低；
+- 更贴合“窗口中还有 segment 就优先从这里选”的约束。
+
+### 5.3 运行语义
+
+本版 WCE 的语义可以概括为：
+
+1. SWOD 继续负责 `identify / hold / skip / release`；
+2. WCE 不负责直接 issue discard；
+3. WCE 也不改写写入路径；
+4. WCE 只在 GC victim selection 时，把 SWOD 已经 hold 的窗口当成优先目标集；
+5. 真正的 discard materialization 仍交给 stock F2FS 的 checkpoint / prefree / issue path。
+
+因此，这一版形成的是：
+
+> **SWOD 保住机会窗口，WCE 优先清掉窗口里的 residual live blocks，stock F2FS 负责最终自然 materialize 成更连续的 discard。**
+
+## 6. 代码改动概述
 
 ### 5.1 新增文件
 
@@ -271,7 +330,15 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `f2fs_swod_refresh_around_locked()`
 - `f2fs_swod_should_skip_locked()`
 - `f2fs_swod_release_all()`
+- `f2fs_swod_has_held()`
+- `f2fs_swod_range_held()`
 - `f2fs_swod_seg_held()`
+
+同时在 `struct swod_ctrl` 中增加了 WCE 统计项：
+
+- `gc_pick_bg_cnt`
+- `gc_pick_fg_cnt`
+- `gc_fallback_cnt`
 
 #### `fs/f2fs/swod.c`
 实现 SWOD 核心逻辑，包括：
@@ -281,6 +348,7 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - held 候选评估
 - hold/release 状态维护
 - issue 路径 skip 判定
+- 面向 WCE 的 held target 查询接口
 
 ---
 
@@ -306,9 +374,15 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
    - `swod_max_held_groups`
    - `struct swod_ctrl *swod`
 
+3. 在 `struct discard_cmd_control` 中增加 WCE 开关：
+   - `swod_completion_enable`
+   - `swod_gc_bg_enable`
+   - `swod_gc_fg_enable`
+
 作用：
 
-- 将 SWOD 作为 discard 子系统的一层附加状态，绑定到 `discard_cmd_control` 生命周期。
+- 将 SWOD 作为 discard 子系统的一层附加状态，绑定到 `discard_cmd_control` 生命周期；
+- 允许在运行时单独控制 target-first WCE 是否生效，以及 BG/FG GC 是否参与。
 
 ---
 
@@ -349,11 +423,27 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 ---
 
+#### `fs/f2fs/gc.c`
+
+本版新增 target-first WCE 逻辑，主要体现在 `get_victim_by_default()`：
+
+1. 判断 WCE 是否允许进入 target pass；
+2. 若当前存在 held windows，则优先只在 held target 集中选 victim；
+3. `next_victim_seg[]` / `check_bg_victims()` / 普通扫描路径都要经过 held-range 匹配；
+4. 若本轮 target pass 完全找不到合法 victim，则回退到 stock picker；
+5. 对 BG / FG pick 次数和 fallback 次数做统计。
+
+需要强调的是：
+
+- 目标集内部仍然沿用 stock F2FS 的合法性检查和 cost 选择；
+- WCE 没有引入新的 GC cost 模型；
+- WCE 只是约束“先在哪些候选里找”。
+
 #### `fs/f2fs/sysfs.c`
 
 主要改动：
 
-新增 SWOD 的 sysfs 参数与统计：
+新增 SWOD / WCE 的 sysfs 参数与统计：
 
 ##### 可写参数
 - `swod_enable`
@@ -365,6 +455,9 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `swod_cmd_pressure`
 - `swod_blk_pressure`
 - `swod_max_held_groups`
+- `swod_completion_enable`
+- `swod_gc_bg_enable`
+- `swod_gc_fg_enable`
 
 ##### 只读统计
 - `swod_held_groups`
@@ -373,6 +466,9 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `swod_success_release_cnt`
 - `swod_timeout_release_cnt`
 - `swod_pressure_release_cnt`
+- `swod_gc_pick_bg_cnt`
+- `swod_gc_pick_fg_cnt`
+- `swod_gc_fallback_cnt`
 
 说明：
 
@@ -456,35 +552,44 @@ SWOD 的动作是：
 
 ---
 
-## 8. 当前限制
+## 9. 当前限制
 
-本实现是 SWOD 的第一版，仍有一些有意保守的设计选择：
+本实现已经从 SWOD-only 发展到 **SWOD + target-first WCE**，但当前仍有一些有意保守或尚未完成的部分：
 
 1. 每个 group 最多只保留一个 held 子窗口；
 2. 不显式建模 latent invalid；
 3. 仅对完全落在 held 子窗口内部的命令做 skip；
-4. 不直接重写 BG GC victim 选择；
-5. 不主动提交“materialized”大 discard，而是交由 stock F2FS 自然处理。
+4. 当前 WCE 采用 target-first 过滤，而不是 `gain(s)` / tie-break 软偏置；
+5. `f2fs_swod_range_held()` 目前只基于 held bitmap 做范围命中判断，还没有更细的 per-window completion score；
+6. 还没有接入 target-zone keep-OPU / non-target IPU-SSR bias；
+7. 不主动提交“materialized”大 discard，而是交由 stock F2FS 自然处理。
 
 这些限制是为了：
 
+- 先形成最小闭环；
 - 降低内核侵入性；
 - 避免状态冲突；
 - 使机制更容易验证与消融。
 
 ---
 
-## 9. 运行时调试建议
+## 10. 运行时调试建议
 
 建议重点观察以下节点：
 
 ### sysfs
 - `swod_enable`
+- `swod_completion_enable`
+- `swod_gc_bg_enable`
+- `swod_gc_fg_enable`
 - `swod_held_groups`
 - `swod_hold_cnt`
 - `swod_skip_cnt`
 - `swod_timeout_release_cnt`
 - `swod_pressure_release_cnt`
+- `swod_gc_pick_bg_cnt`
+- `swod_gc_pick_fg_cnt`
+- `swod_gc_fallback_cnt`
 
 ### 原有 F2FS/Discard 指标
 - `pending_discard`
@@ -492,31 +597,39 @@ SWOD 的动作是：
 - `issued_discard`
 - `undiscard_blks`
 - `gc_mode`
+- `gc_background_calls`
+- `moved_blocks_background`
 
 若启用了 debugfs 扩展，还可结合：
 
 - `/sys/kernel/debug/f2fs/status`
 
-一起观察 SWOD 状态是否与系统当前 discard/GC 压力一致。
+一起观察：
+
+- WCE 是否真的在 held target 上 pick 到 victim；
+- fallback 是否过多；
+- held windows 的 residual live 是否下降得更快。
 
 ---
 
-## 10. 后续扩展方向
+## 11. 后续扩展方向
 
-后续可以考虑以下增强：
+在当前 target-first WCE 已经落地的基础上，后续建议按以下顺序推进：
 
-1. 为 held window 增加 BG GC tie-break hint；
-2. 与动机二中的源头塑形机制协同；
-3. 在 group 内支持多个不重叠 held 子窗口；
-4. 增加更细粒度的成功补全统计；
-5. 增加针对 tpcc/MySQL 等真实负载的在线 window 演化观测。
+1. 先验证 target-first WCE 的收益、代价与 fallback 频率；
+2. 视实验结果决定是否把 target-first 进一步收敛为 `gain(s)` / tie-break 版本，或保留为主方案；
+3. 实现 target-zone keep-OPU 规则；
+4. 实现 non-target IPU / SSR bias；
+5. 在 group 内支持多个不重叠 held 子窗口；
+6. 增加更细粒度的 completion 统计；
+7. 增加针对 fio 与 tpcc/MySQL 等真实负载的在线 window 演化观测。
 
 ---
 
-## 11. 总结
+## 12. 总结
 
-SWOD 的本质不是“更激进地发出更长 discard”，而是：
+当前版本的本质不是“更激进地发出更长 discard”，而是：
 
-> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再为后续补全机制留下时间与目标。
+> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再由 target-first WCE 优先围绕这些 held windows 清理 residual live blocks，最终仍由 stock F2FS 自然完成 materialization 与 issue。
 
-通过这一设计，SWOD 将 F2FS discard 调度从“仅基于当前请求的被动消费”，推进到“对局部未来合并机会进行主动保留”的方向，同时又尽可能保持与 stock F2FS 架构兼容、实现轻量、边界清晰。
+通过这一设计，系统已经从“仅基于当前请求的被动 discard 消费”，推进到“先保留机会，再围绕目标窗口做最小补全闭环”的方向，同时又尽可能保持与 stock F2FS 架构兼容、实现轻量、边界清晰。
