@@ -363,12 +363,12 @@ static inline bool swod_wce_enabled(struct f2fs_sb_info *sbi, int gc_type)
 
 	if (gc_type == BG_GC)
 		return !!dcc->swod_gc_bg_enable;
-
-	if (gc_type == FG_GC) {
-		if (sbi->gc_mode == GC_URGENT_HIGH)
-			return false;
+	// 现在的 urgent 策略已经从“完全禁用”变成“允许，但窗口更小
+	// WCE 就不该在 GC_URGENT_HIGH 上再单独硬 bypass，
+	// 否则策略还是不对齐：SWOD 能 hold，小窗口也能建，
+	// 但 FG urgent-high 却不去 completion。
+	if (gc_type == FG_GC)
 		return !!dcc->swod_gc_fg_enable;
-	}
 
 	return false;
 }
@@ -827,9 +827,12 @@ retry:
 		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
 			goto next;
 
-		if (swod_target_pass &&
-		    !swod_wce_match(sbi, segno, p.ofs_unit))
-			goto next;
+		// 当 swod_target_pass == true 时，只有真正命中 held target 的候选才消耗搜索预算
+		if (swod_target_pass) {
+			if (!swod_wce_match(sbi, segno, p.ofs_unit))
+				goto next;
+			nsearched++;
+		}
 
 		if (is_atgc) {
 			add_victim_entry(sbi, &p, segno);
@@ -886,7 +889,7 @@ got_it:
 got_result:
 		if (swod_target_pass)
 			swod_wce_account_pick(sbi, gc_type);
-			
+
 		if (p.alloc_mode == LFS) {
 			secno = GET_SEC_FROM_SEG(sbi, p.min_segno);
 			if (gc_type == FG_GC)

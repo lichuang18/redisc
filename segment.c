@@ -2327,8 +2327,8 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 init_thread:
 	err = f2fs_start_discard_thread(sbi);
 	if (err) {
-		kfree(dcc);
-		SM_I(sbi)->dcc_info = NULL;
+		// kfree(dcc);
+		// SM_I(sbi)->dcc_info = NULL;
 		goto fail_thread;
 	}
 	return 0;

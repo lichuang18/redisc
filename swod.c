@@ -28,6 +28,25 @@ static inline unsigned int swod_group_nsegs(struct swod_ctrl *sw,
 	return min(sw->win_segs, sw->nr_main_segs - first);
 }
 
+static inline bool swod_is_urgent(struct f2fs_sb_info *sbi)
+{
+	return sbi->gc_mode == GC_URGENT_HIGH ||
+	       sbi->gc_mode == GC_URGENT_LOW;
+}
+
+static inline unsigned int swod_max_hold_len(struct f2fs_sb_info *sbi,
+					     struct swod_ctrl *sw,
+					     unsigned int gid)
+{
+	unsigned int n = swod_group_nsegs(sw, gid);
+
+	if (sbi->gc_mode == GC_URGENT_HIGH)
+		return min(n, 1U);
+	if (sbi->gc_mode == GC_URGENT_LOW)
+		return min(n, 2U);
+	return n;
+}
+
 static unsigned int swod_default_win_segs(struct f2fs_sb_info *sbi)
 {
     struct block_device *bdev;
@@ -79,13 +98,12 @@ static inline bool swod_regime_blocked(struct f2fs_sb_info *sbi,
 	if (!swod_enabled(dcc))
 		return true;
 
-	/* SWOD only works on background discard regime */
-	if (dpolicy && dpolicy->type != DPOLICY_BG)
-		return true;
-
-	/* urgent GC/discard regime: let stock F2FS win */
-	if (sbi->gc_mode == GC_URGENT_HIGH ||
-	    sbi->gc_mode == GC_URGENT_LOW)
+	/*
+	 * Normal path: SWOD only shapes background discard.
+	 * Urgent path: still allow SWOD, but urgent windows are shrunk
+	 * in swod_eval_group_locked().
+	 */
+	if (dpolicy && dpolicy->type != DPOLICY_BG && !swod_is_urgent(sbi))
 		return true;
 
 	/* stock discard thread already treats this as aggressive regime */
@@ -307,7 +325,8 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 	unsigned int best_off = 0, best_len = 0;
 	unsigned int best_qbp = 0, best_lbp = UINT_MAX;
 	unsigned long best_oldest = 0;
-	unsigned int i, off, len;
+    unsigned int max_len = swod_max_hold_len(sbi, sw, gid);
+	unsigned int i, off, len, max_this_len;
 
 	if (!sw || !n)
 		return;
@@ -318,17 +337,26 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 		return;
 	}
 
-	/* already held: do not re-target mid-flight; only keep / release */
+	/*
+	 * already held:
+	 * - if urgent mode now requires a smaller window than the current hold,
+	 *   release and re-evaluate below;
+	 * - otherwise only keep / release.
+	 */
 	if (g->state == SWOD_G_HELD) {
-		if (swod_window_ready_locked(sbi, gid)) {
-			swod_release_group_locked(sbi, gid, SWOD_REL_SUCCESS);
+		if (g->hold_len > max_len)
+			swod_release_group_locked(sbi, gid, SWOD_REL_PRESSURE);
+		else {
+			if (swod_window_ready_locked(sbi, gid)) {
+				swod_release_group_locked(sbi, gid, SWOD_REL_SUCCESS);
+				return;
+			}
+			if (time_after_eq(now, g->hold_until)) {
+				swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
+				return;
+			}
 			return;
 		}
-		if (time_after_eq(now, g->hold_until)) {
-			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
-			return;
-		}
-		return;
 	}
 
 	if (sw->nr_held_groups >= dcc->swod_max_held_groups)
@@ -342,8 +370,9 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 
 	for (off = 0; off < n; off++) {
 		unsigned long cur_oldest = 0;
-
-		for (len = 1; off + len <= n; len++) {
+        max_this_len = min(max_len, n - off);
+        // 这才是真正的“urgent 下仍然在整个 group 内挑子窗口，但最长只允许 1/2 seg”
+		for (len = 1; len <= max_this_len; len++) {
 			u64 cap, qbp, lbp;
 			unsigned int endi = off + len - 1;
 			unsigned int Q, L;
