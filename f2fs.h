@@ -421,11 +421,18 @@ struct discard_cmd_control {
 	unsigned int swod_max_held_groups;     /* bound waiting scope */
 
 	struct swod_ctrl *swod;
-	
+
 	/* ---------- WCE tunables ---------- */
 	unsigned int swod_completion_enable;   /* 0/1 */
 	unsigned int swod_gc_bg_enable;        /* 0/1 */
 	unsigned int swod_gc_fg_enable;        /* 0/1 */
+	
+	/* ---------- selective fragment-IPU tunables ---------- */
+	unsigned int swod_frag_ipu_enable;         /* 0/1 */
+	unsigned int swod_frag_ipu_max_pend_blks;  /* tiny fragment upper bound */
+	unsigned int swod_frag_ipu_min_cmds;       /* fragment count lower bound */
+	unsigned int swod_frag_ipu_age_ms;         /* oldest pending age threshold */
+	unsigned int swod_frag_ipu_skip_hot;       /* 0/1 */
 };
 
 /* for the list of fsync inodes, used only during recovery */

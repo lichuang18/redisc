@@ -4,7 +4,7 @@
 
 * 文档名称：SWOD 与动机二联合设计文档
 * 面向版本：Linux 5.15 / F2FS
-* 当前状态：SWOD 已实现；动机二已完成第一版 target-first WCE，实现了围绕 held windows 的 GC 定向补全最小闭环；SSS 尚未实现
+* 当前状态：本轮 discard 研究设计已定稿并已落地为“SWOD + target-first WCE + Selective Fragment IPU”版本；WCE 为主路径，SFI 为辅路径；真正的 materialization 仍由 stock F2FS 完成
 * 文档用途：用于后续继续实现、论文撰写、实验规划与代码回溯
 
 ---
@@ -269,7 +269,7 @@ SWOD 不做：
 
 ---
 
-## 5. 动机二对接设计（待实现）
+## 5. 动机二对接设计（本轮设计定稿）
 
 动机二的设计分为两个子层：
 
@@ -368,19 +368,27 @@ struct swod_target {
 * **不是主动发明新的大 discard**；
 * **只是把 SWOD 保住的窗口转化为 GC 的优先目标集。**
 
-### 5.2 子层 B：Source-side Shaping（SSS）
+### 5.2 子层 B：Selective Fragment IPU（SFI，辅路径）
 
 目标：
 
-* 让 held windows 更快完成；
-* 同时降低非目标区域新增 partial-invalid / discard backlog 的形成速度。
+* 在不干扰 held windows completion 的前提下；
+* 尽量减少 non-target zone 继续形成新的 tiny discard / partial-invalid fragments。
 
-关键思想：
+#### 5.2.1 设计定位
 
-* **对 held windows 内部，应保持 OPU，而不是增强 IPU**；
-* **对 held windows 外部，应更积极利用现有 IPU/SSR 入口，减少新的分散失效。**
+这一版不是把 source-side shaping 做成“全局偏向 IPU/SSR”。
 
-#### 5.2.1 为什么目标窗口内应保持 OPU
+本轮最终采用的是一个更窄的辅路径：
+
+* 只在 `LFS` 场景下考虑；
+* 只在系统当前确实存在 held windows 时考虑；
+* 只对 **non-target zone** 上极少量“小、碎、老、非热”的 fragment 给一次 IPU 例外；
+* target zone 仍然坚持不碰 IPU，避免和 WCE completion 打架。
+
+换句话说，当前不是“SSS 全量落地”，而是把 non-target zone 的 shaping 收敛成一个更容易控制的 **Selective Fragment IPU**。
+
+#### 5.2.2 为什么 target zone 仍保持 OPU
 
 held windows 的目标是让其中剩余 live blocks 尽快消失。
 
@@ -389,43 +397,45 @@ held windows 的目标是让其中剩余 live blocks 尽快消失。
 * 若未来更新采用 OPU，则新版本写到别处，旧位置在目标窗口内变 invalid；
 * 若采用 IPU，则旧位置被原地覆盖，反而继续保留“有效性”。
 
-因此，对 target zone 的策略应为：
+因此，对 target zone 的策略保持不变：
 
 ```text
 若旧块位于 held window 内 -> 禁止 IPU，保留 OPU
 ```
 
-#### 5.2.2 为什么非目标区域应偏向 IPU/SSR
+#### 5.2.3 为什么 non-target zone 只做窄 IPU 例外
 
-SWOD 已经保住了少量有价值的窗口，此时系统应尽量避免在其他区域继续制造新的 partial-invalid segments。
+当前代码基线下，`f2fs_need_SSR()` 在 `f2fs_lfs_mode(sbi)` 下直接返回 `false`，因此 SSR 并不是这版设计可自然承接的主路径。
 
-因此对 non-target zone：
+在这个前提下，更现实的 shaping 方式是：
 
-* 更积极利用现有 `IPU/SSR` 入口
-* 更少制造新的未来 discard demand
+* 不动 held target；
+* 不把系统全局推向 IPU；
+* 只对 non-target zone 上一小部分“小、碎、老、非热”的 fragment 做一次很克制的 IPU 例外。
 
-#### 5.2.3 双区策略
+这样做的目的不是“完成 held windows”，而是：
 
-##### Target zone（held windows）
+* 减少其他区域继续长出更多 tiny discard；
+* 控制 future discard demand 的继续膨胀；
+* 作为 WCE 主路径之外的辅助抑制动作。
 
-目标：
+#### 5.2.4 当前代码中的筛选依据
 
-* 加速剩余 live blocks 消失
+SFI 直接复用 SWOD 已维护的 segment 侧摘要与 held 状态：
 
-策略：
+* `pend_blks`：反映 tiny fragment 规模
+* `nr_cmds`：反映碎片度
+* `oldest_jiffies`：反映 fragment 年龄
+* `hold_segmap` / `nr_held_groups`：判断当前是否存在 held windows，以及某个 segment 是否属于 target zone
 
-* 覆盖这些旧块的未来更新维持 OPU
-* 配合 WCE 的 BG GC completion bonus
+再叠加：
 
-##### Non-target zone（其他区域）
+* non-target only
+* skip hot data
+* age threshold
+* tiny fragment threshold
 
-目标：
-
-* 尽量少制造新的 invalid blocks / partial-invalid segments
-
-策略：
-
-* 在存在 held windows 时，对非目标区域更积极地应用现有 IPU / SSR 策略
+因此，SFI 是一个 advisory-only 的窄筛选器，而不是全局策略切换器。
 
 ---
 
@@ -440,8 +450,8 @@ NORMAL
   v
 HELD
   |
-  |  WCE 通过 BG GC completion bonus 减少 residual live
-  |  SSS 在 target zone 保持 OPU，在 non-target zone 减少新增 invalid
+  |  WCE 通过 target-first completion 减少 residual live
+  |  SFI 在 non-target zone 抑制新的 tiny fragment 增长
   v
 NEAR-COMPLETE
   |
@@ -460,7 +470,7 @@ ISSUED BY STOCK F2FS
 其中：
 
 * SWOD 不直接发出大 discard
-* WCE/SSS 也不直接伪造新的大 discard
+* WCE/SFI 也不直接伪造新的大 discard
 * 真正的 materialization 仍交给 stock F2FS 完成
 
 ---
@@ -486,7 +496,7 @@ ISSUED BY STOCK F2FS
 
   * 暴露 SWOD 参数与统计
 
-### 7.2 已完成 / 待扩展：WCE 落点
+### 7.2 已完成：WCE 落点
 
 当前已完成的落点：
 
@@ -499,25 +509,29 @@ ISSUED BY STOCK F2FS
 
   * 已提供 `has_held()` / `range_held()` / `seg_held()` 查询接口
 
-后续若要继续扩展为原始软偏置版本，推荐补充：
+### 7.3 已完成：SFI 落点
 
-* `fs/f2fs/gc.c`
+当前已完成的落点：
 
-  * 在 BG GC victim selection 处引入 bounded completion tie-break / gain(s)
+* `fs/f2fs/f2fs.h`
+
+  * 已增加 `swod_frag_ipu_*` tunables
 * `fs/f2fs/swod.c`
 
-  * 提供 `collect_targets()` 或更细粒度的 per-window target descriptor
+  * 已增加 `f2fs_swod_should_frag_ipu()` 作为 advisory-only selector
+  * 仅在 LFS + held windows 存在 + non-target + non-hot + tiny/fragmented/aged 条件下放行
+* `fs/f2fs/swod.h`
 
-### 7.3 待实现：SSS 落点
+  * 已增加 SFI 对外接口与统计项
+* `fs/f2fs/sysfs.c`
 
-推荐落点：
+  * 已增加 SFI 的开关、阈值与 skip/pick 统计
 
-* 写路径中最终决定 `IPU/OPU` 的判定点
+需要强调的是：
 
-  * 若旧块位于 held window，则禁止 IPU
-* SSR 触发条件的运行时偏置点
-
-  * 当系统存在 held windows 时，对 non-target zone 略微提早 SSR
+* SFI 是 non-target zone 上的一个很窄的辅助路径；
+* 它不是全局 IPU 开关；
+* 也不是以 SSR 作为主策略的 shaping 版本。
 
 ---
 
@@ -543,57 +557,61 @@ ISSUED BY STOCK F2FS
 * `swod_gc_bg_enable`
 * `swod_gc_fg_enable`
 
-若后续继续扩展为原始 bonus / tie-break 版本，可再增加：
+### 8.3 SFI 参数
 
-* `swod_gc_tie_margin`
-* `swod_gc_bonus_max`
+当前已实现：
 
-### 8.3 SSS 新增参数（建议）
-
-* `swod_shaping_enable`
-* `swod_target_keep_opu`
-* `swod_nontarget_ipu_bias_util`
-* `swod_nontarget_ssr_bias_secs`
+* `swod_frag_ipu_enable`
+* `swod_frag_ipu_max_pend_blks`
+* `swod_frag_ipu_min_cmds`
+* `swod_frag_ipu_age_ms`
+* `swod_frag_ipu_skip_hot`
 
 ---
 
-## 9. 实现顺序建议
+## 9. 本轮设计的最终实现形态
 
-为了降低复杂度并保持论文结构清晰，推荐按以下顺序实现：
+本轮 discard 研究设计已经结束，最终实现形态如下：
 
-### 第一步：完成 SWOD（已完成）
-
-目标：
-
-* 证明系统能够识别并 hold 值得保留的窗口
-* 证明 issue 路径能对 held cmd 实现 skip
-
-### 第二步：实现 WCE（已完成第一版）
-
-当前已完成：
-
-* 已实现 `SWOD + target-first GC selection` 的最小闭环
-* 已能在 held windows 存在时，优先围绕目标段做 victim selection
-* 已保留 stock fallback，避免目标集中无合法 victim 时阻塞 GC
-
-仍待扩展：
-
-* 是否需要进一步演进到 `gain(s)` / tie-break 版本，待实验后决定
-* 若保留 target-first 作为主方案，可继续做更细粒度 target score / target range 过滤
-
-### 第三步：实现 SSS 的第一条规则
+### 9.1 SWOD
 
 目标：
 
-* 对 held windows 内的更新保持 OPU
-* 加速 held windows 的旧位置失效
+* 识别并 hold 高价值窗口
+* 为后续 completion 暴露 held target set
 
-### 第四步：实现 SSS 的第二条规则
+### 9.2 WCE（主路径）
 
 目标：
 
-* 对 held windows 外部更积极应用现有 IPU / SSR
-* 降低系统新增 backlog 的形成速度
+* 围绕 held windows 优先做 completion
+* 让窗口更快接近 `READY-FOR-MATERIALIZATION`
+
+实现形态：
+
+* target-first victim selection
+* held-target-first pass + stock fallback
+
+### 9.3 SFI（辅路径）
+
+目标：
+
+* 不干扰 held window completion
+* 减少 non-target zone 继续形成 tiny discard / fragment backlog
+
+实现形态：
+
+* LFS-only
+* held-windows-present only
+* non-target only
+* tiny / fragmented / aged / non-hot only
+
+### 9.4 stock F2FS
+
+目标：
+
+* 继续负责 checkpoint / prefree / issue path
+* 自然完成 discard materialization 与发射
 
 ---
 
@@ -624,46 +642,40 @@ ISSUED BY STOCK F2FS
 
 ---
 
-## 11. 当前已完成 / 待完成清单
+## 11. 当前版本已记录完成的内容
 
 ### 已完成
 
-* SWOD 设计完成
+* SWOD 设计与实现完成
 * SWOD 轻量状态机完成
 * SWOD issue skip 逻辑完成
 * SWOD sysfs 接口完成
-* SWOD 多窗口（多 group 并发 held）语义已明确
-* SWOD 到 WCE 的 held-target 查询接口已完成
-* 第一版 WCE 已完成：target-first victim selection + stock fallback
-* WCE 的 sysfs 开关与 pick/fallback 统计已完成
+* SWOD 多窗口（多 group 并发 held）语义明确
+* SWOD 到 WCE 的 held-target 查询接口完成
+* WCE 主路径完成：target-first victim selection + stock fallback
+* WCE 的 sysfs 开关与 pick/fallback 统计完成
+* SFI 辅路径完成：基于 `pend_blks / nr_cmds / oldest_jiffies / hold_segmap` 的窄 fragment-IPU selector
+* SFI 的 sysfs 开关、阈值与 skip/pick 统计完成
 
-### 待完成
+### 本文件要表达的结论
 
-* 验证 target-first WCE 的收益、代价与 fallback 频率
-* 视实验结果决定是否继续实现 `gain(s)` / tie-break 软偏置版本
-* target zone keep-OPU 规则
-* non-target zone IPU/SSR bias
-* 联合实验与消融评估
+* 本轮设计到这里已经定稿；
+* 当前版本的主路径是 WCE，辅路径是 SFI；
+* SSR 不作为本轮设计的主 shaping 路径；
+* 真正的 discard materialization 仍由 stock F2FS 完成。
 
 ---
 
-## 12. 后续继续开发时的建议
+## 12. 下次重新开启会话时应当知道什么
 
-下次继续时，建议优先做如下工作：
+阅读本文件后，应当能够立即恢复以下上下文：
 
-1. 先基于当前代码验证 target-first WCE：
-   * `swod_gc_pick_bg_cnt`
-   * `swod_gc_pick_fg_cnt`
-   * `swod_gc_fallback_cnt`
-   * held windows 的 `lres` 是否下降更快
-2. 判断 target-first 是否已经足够：
-   * 若收益明显且副作用可接受，可保留为主方案并继续做 SSS；
-   * 若偏置过强或 fallback 过多，再补 `gain(s)` / tie-break 版本
-3. 优先接入 target-zone keep-OPU 规则
-4. 再接 non-target IPU / SSR bias
-5. 最后补联合实验与消融
-
-如此可以保证下一步仍然是独立可验证、可消融、可回滚的。
+1. 当前版本不是“只有 SWOD”，而是 **SWOD + WCE + SFI**；
+2. 其中 **WCE 是主路径**，负责围绕 held windows 做 completion；
+3. **SFI 是辅路径**，只在 non-target zone 上抑制 tiny fragment 继续形成；
+4. 当前没有把 SSR 作为主策略，因为现有代码基线下 `f2fs_need_SSR()` 在 `f2fs_lfs_mode(sbi)` 下直接返回 `false`；
+5. 当前版本不直接伪造大 discard，真正的 materialization 仍交给 stock F2FS；
+6. 这轮设计本身已经结束，后续若有改动，应视为下一轮演进而非本轮定义的一部分。
 
 ---
 

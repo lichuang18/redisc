@@ -324,6 +324,23 @@ static ssize_t swod_pressure_release_cnt_show(struct f2fs_attr *a,
 			&dcc->swod->pressure_release_cnt));
 }
 // swod over
+#define SWOD_COUNTER_SHOW(_name, _field)				 \
+static ssize_t _name##_show(struct f2fs_attr *a,			 \
+		struct f2fs_sb_info *sbi, char *buf)			 \
+{									 \
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;		 \
+	if (!dcc || !dcc->swod)						 \
+		return sysfs_emit(buf, "0\n");				 \
+	return sysfs_emit(buf, "%llu\n",				 \
+		(unsigned long long)atomic64_read(&dcc->swod->_field)); \
+}
+
+SWOD_COUNTER_SHOW(swod_frag_ipu_pick_cnt, frag_ipu_pick_cnt);
+SWOD_COUNTER_SHOW(swod_frag_ipu_skip_target_cnt, frag_ipu_skip_target_cnt);
+SWOD_COUNTER_SHOW(swod_frag_ipu_skip_hot_cnt, frag_ipu_skip_hot_cnt);
+SWOD_COUNTER_SHOW(swod_frag_ipu_skip_age_cnt, frag_ipu_skip_age_cnt);
+SWOD_COUNTER_SHOW(swod_frag_ipu_skip_shape_cnt, frag_ipu_skip_shape_cnt);
+
 // wce start
 static ssize_t swod_gc_pick_bg_cnt_show(struct f2fs_attr *a,
 		struct f2fs_sb_info *sbi, char *buf)
@@ -625,6 +642,36 @@ out:
 		return count;
 	}
 	// swod end
+	// sfi start
+	if (!strcmp(a->attr.name, "swod_frag_ipu_enable") ||
+	    !strcmp(a->attr.name, "swod_frag_ipu_skip_hot")) {
+		if (t > 1)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_ipu_min_cmds")) {
+		if (!t || t > 64)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_ipu_max_pend_blks")) {
+		if (!t || t > sbi->blocks_per_seg)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_ipu_age_ms")) {
+		if (!t || t > 600000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	// sfi end
 	// wce start
 	if (!strcmp(a->attr.name, "swod_completion_enable") ||
 	    !strcmp(a->attr.name, "swod_gc_bg_enable") ||
@@ -892,6 +939,17 @@ F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_hold_max_ms, swod_hold_max_ms);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_cmd_pressure, swod_cmd_pressure);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_blk_pressure, swod_blk_pressure);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_max_held_groups, swod_max_held_groups);
+// sfi
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_ipu_enable, swod_frag_ipu_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_ipu_max_pend_blks, swod_frag_ipu_max_pend_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_ipu_min_cmds, swod_frag_ipu_min_cmds);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_ipu_age_ms, swod_frag_ipu_age_ms);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_ipu_skip_hot, swod_frag_ipu_skip_hot);
 
 // wce
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
@@ -955,6 +1013,13 @@ F2FS_GENERAL_RO_ATTR(swod_skip_cnt);
 F2FS_GENERAL_RO_ATTR(swod_success_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_timeout_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_pressure_release_cnt);
+
+//sfi
+F2FS_GENERAL_RO_ATTR(swod_frag_ipu_pick_cnt);
+F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_target_cnt);
+F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_hot_cnt);
+F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_age_cnt);
+F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_shape_cnt);
 
 // wce
 F2FS_GENERAL_RO_ATTR(swod_gc_pick_bg_cnt);
@@ -1111,6 +1176,19 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_timeout_release_cnt),
 	ATTR_LIST(swod_pressure_release_cnt),
 	
+	// sfi
+	ATTR_LIST(swod_frag_ipu_enable),
+	ATTR_LIST(swod_frag_ipu_max_pend_blks),
+	ATTR_LIST(swod_frag_ipu_min_cmds),
+	ATTR_LIST(swod_frag_ipu_age_ms),
+	ATTR_LIST(swod_frag_ipu_skip_hot),
+
+	ATTR_LIST(swod_frag_ipu_pick_cnt),
+	ATTR_LIST(swod_frag_ipu_skip_target_cnt),
+	ATTR_LIST(swod_frag_ipu_skip_hot_cnt),
+	ATTR_LIST(swod_frag_ipu_skip_age_cnt),
+	ATTR_LIST(swod_frag_ipu_skip_shape_cnt),
+	
 	// wce
 	ATTR_LIST(swod_completion_enable),
 	ATTR_LIST(swod_gc_bg_enable),
@@ -1118,7 +1196,7 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_gc_pick_bg_cnt),
 	ATTR_LIST(swod_gc_pick_fg_cnt),
 	ATTR_LIST(swod_gc_fallback_cnt),
-	
+
 	NULL,
 };
 ATTRIBUTE_GROUPS(f2fs);

@@ -645,3 +645,90 @@ bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
 {
 	return f2fs_swod_range_held(sbi, segno, 1);
 }
+
+/*
+ * Advisory-only selector for a very narrow LFS-side fragment IPU exception.
+ * It is only used while SWOD currently has held windows, and never for
+ * segments that belong to a held target window.
+    不决定 IPU/OPU；
+    只判断“这个 old block 对应的 seg 是否是一个老、小、碎、非 target、非热的 fragment 候选”
+*/
+bool f2fs_swod_should_frag_ipu(struct inode *inode,
+			       struct f2fs_io_info *fio)
+{
+	struct f2fs_sb_info *sbi = fio->sbi;
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int segno, pend_blks, nr_cmds, age_thr;
+	unsigned long oldest, age_ms;
+
+	if (!dcc || !swod_enabled(dcc) || !dcc->swod_frag_ipu_enable)
+		return false;
+	if (!f2fs_lfs_mode(sbi))
+		return false;
+	if (!fio || !__is_valid_data_blkaddr(fio->old_blkaddr))
+		return false;
+
+	/*
+	 * SFI 是 WCE 的辅助路径，只在系统当前真的有 held windows 时启用。
+	 */
+	if (!f2fs_swod_has_held(sbi))
+		return false;
+
+	sw = dcc->swod;
+	segno = GET_SEGNO(sbi, fio->old_blkaddr);
+	if (segno >= sw->nr_main_segs)
+		return false;
+
+	/*
+	 * target window 绝不走这个辅助 IPU，避免和 WCE completion 打架。
+	 */
+	if (f2fs_swod_seg_held(sbi, segno)) {
+		atomic64_inc(&sw->frag_ipu_skip_target_cnt);
+		return false;
+	}
+
+	/*
+	 * 热数据直接跳过；温/冷数据更适合这条路径。
+	 */
+	if (dcc->swod_frag_ipu_skip_hot &&
+	    (file_is_hot(inode) || is_inode_flag_set(inode, FI_HOT_DATA))) {
+		atomic64_inc(&sw->frag_ipu_skip_hot_cnt);
+		return false;
+	}
+
+	/*
+	 * advisory bias only; lockless snapshot of seg_hint is sufficient.
+	 */
+	pend_blks = READ_ONCE(sw->seg_hint[segno].pend_blks);
+	nr_cmds = READ_ONCE(sw->seg_hint[segno].nr_cmds);
+	if (!pend_blks ||
+	    pend_blks > dcc->swod_frag_ipu_max_pend_blks ||
+	    nr_cmds < dcc->swod_frag_ipu_min_cmds) {
+		atomic64_inc(&sw->frag_ipu_skip_shape_cnt);
+		return false;
+	}
+
+	oldest = READ_ONCE(sw->seg_hint[segno].oldest_jiffies);
+	if (!oldest || time_after(oldest, jiffies)) {
+		atomic64_inc(&sw->frag_ipu_skip_age_cnt);
+		return false;
+	}
+
+	age_ms = jiffies_to_msecs(jiffies - oldest);
+
+	/*
+	 * 冷数据更容易放行；非冷数据要更老才值得这次 IPU。
+	 */
+	age_thr = dcc->swod_frag_ipu_age_ms;
+	if (!file_is_cold(inode))
+		age_thr <<= 1;
+
+	if (age_ms < age_thr) {
+		atomic64_inc(&sw->frag_ipu_skip_age_cnt);
+		return false;
+	}
+
+	atomic64_inc(&sw->frag_ipu_pick_cnt);
+	return true;
+}

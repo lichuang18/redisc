@@ -54,6 +54,12 @@ struct swod_ctrl {
     atomic64_t gc_pick_bg_cnt;
 	atomic64_t gc_pick_fg_cnt;
 	atomic64_t gc_fallback_cnt;
+    /* ---------- selective fragment-IPU stats ---------- */
+	atomic64_t frag_ipu_pick_cnt;
+	atomic64_t frag_ipu_skip_target_cnt;
+	atomic64_t frag_ipu_skip_hot_cnt;
+	atomic64_t frag_ipu_skip_age_cnt;
+	atomic64_t frag_ipu_skip_shape_cnt;
 };
 
 int  f2fs_swod_init(struct f2fs_sb_info *sbi);
@@ -69,11 +75,13 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 
 void f2fs_swod_release_all(struct f2fs_sb_info *sbi,
 			   enum swod_release_reason why);
-               
+
 bool f2fs_swod_has_held(struct f2fs_sb_info *sbi);
 bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
 			  unsigned int nr_segs);
 
 bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno);
 
+bool f2fs_swod_should_frag_ipu(struct inode *inode,
+			       struct f2fs_io_info *fio);
 #endif

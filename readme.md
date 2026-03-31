@@ -18,10 +18,11 @@ SWOD 的设计初衷如下：
 
 ## 2. 设计目标
 
-当前代码已经形成两层协同：
+当前版本的设计已经定稿，整体采用：
 
-1. **SWOD**：在 pending discard 队列之上识别并 hold 值得保留的窗口；
-2. **WCE（本版）**：把 SWOD 已经 hold 的窗口当成 GC 的优先目标集，优先减少其中的 residual live blocks。
+1. **SWOD**：在 pending discard 队列之上识别并 hold 高价值窗口；
+2. **WCE（主路径）**：围绕这些 held windows 优先做 completion，让窗口更快接近 `READY-FOR-MATERIALIZATION`；
+3. **Selective Fragment IPU / SFI（辅路径）**：只在 LFS 场景下，对 non-target zone 中少量“小、碎、老、非热”的 fragment 给一次很窄的 IPU 例外，以减少新的 tiny discard 继续形成。
 
 SWOD 只解决以下问题：
 
@@ -31,22 +32,28 @@ SWOD 只解决以下问题：
 
 > 当 SWOD 已经保住一些 held windows 之后，如何让 GC 优先围绕这些目标段工作，使窗口更快成熟？
 
-SWOD / WCE **都不负责**：
+本版 SFI 解决的问题是：
+
+> 在不干扰 held windows completion 的前提下，如何尽量少让 non-target zone 继续长出更多 tiny discard / partial-invalid fragments？
+
+SWOD / WCE / SFI **都不负责**：
 
 - 直接重写 `ipu_policy`
 - 直接修改 `alloc_mode`
-- 直接修改 SSR 提前触发阈值
 - 直接重排前台写入落点
 - 直接将 held 窗口强行转化为大 discard 并立即发出
 - 主动伪造新的大 discard run
+- 把 SSR 作为当前版本的主策略
 
 因此，当前版本的职责是：
 
 1. **识别机会窗口**
 2. **暂缓发射（hold）**
 3. **在系统高压时及时让路**
-4. **向 WCE 暴露“哪里值得优先补全”的 held target set**
+4. **向 WCE 暴露 held target set**
 5. **在 GC 侧优先清理 held windows 中仍残留 live blocks 的段**
+6. **在 non-target zone 上仅对少量高性价比旧碎片提供一次窄 IPU 例外**
+7. **仍由 stock F2FS 负责最终 materialization 与 issue**
 
 ---
 
@@ -267,11 +274,23 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 ---
 
-## 5. Target-first WCE（本版新增）
+## 5. 最终方案：WCE 为主，Selective Fragment IPU 为辅
 
-### 5.1 设计定位
+### 5.1 总体定位
 
-这版 WCE 不是仓库文档里最初设想的“BG_GC 上做 bounded completion bonus / tie-break”的软偏置版本，而是一个更直接的 **target-first WCE**：
+这次定稿后的 discard 研究设计采用：
+
+- **WCE 为主路径**：继续让 SWOD 先识别并 hold 高价值窗口，再由 WCE 围绕这些 held windows 优先做 completion；
+- **Selective Fragment IPU（SFI）为辅路径**：只在 LFS 场景下，对 non-target zone 中极少量“小、碎、老、非热”的 fragment 给一次很窄的 IPU 例外；
+- **stock F2FS 负责 materialization**：SWOD / WCE / SFI 都不直接伪造大 discard，真正的连续 discard run 仍通过 stock F2FS 的 checkpoint / prefree / issue path 自然形成。
+
+也就是说，这版不是“全局转向 IPU”，而是：
+
+> **target zone 继续围绕 held windows 做 completion；non-target zone 只做极窄、极保守的 fragment-IPU 辅助塑形。**
+
+### 5.2 WCE 主路径
+
+当前 WCE 采用的是 **target-first** 而不是原始文档里的 `gain(s)` / tie-break 软偏置：
 
 - 只要当前 SWOD 维护的 held windows 还存在；
 - 且 GC 工作在允许 WCE 的模式下；
@@ -280,40 +299,65 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 换句话说，本版 WCE 的核心不是重写 cleaner 成本模型，而是给 stock victim picker 外面套一层 **held-target-first filter**。
 
-### 5.2 为什么采用 target-first
+它服务的目标是：
 
-当前代码里，SWOD 已经维护了 `hold_segmap`，并且能够快速回答：
+- 优先减少 held windows 中的 residual live blocks；
+- 让窗口更快沿着 `NORMAL -> HELD -> NEAR-COMPLETE -> READY-FOR-MATERIALIZATION` 演化；
+- 最终由 stock F2FS 自然 materialize 成更连续的 discard run。
 
-- 当前是否还有 held windows；
-- 某个 `segno` 是否落在 held window 内；
-- 某个 victim range 是否与 held window 有交集。
+### 5.3 Selective Fragment IPU（SFI）辅路径
 
-基于这条现成接口，实现一个最小闭环的方式就是：
+SFI 不是全局 IPU 策略，而是一个非常窄的辅助路径。
 
-- 让 GC 先只看 held target set；
-- 在目标集内部仍沿用 stock F2FS 的合法性检查与 cost 选择；
-- 若目标集中没有合法 victim，再退回 stock picker。
+它只在以下前提下考虑放行：
 
-这样做的优点是：
+- 当前系统处于 `LFS` 场景；
+- 当前 SWOD 仍然有 held windows；
+- 旧块所在 segment **不属于 held target window**；
+- 该 segment 表现为“小、碎、老、非热”的 pending-discard fragment。
 
-- 不必先实现 `collect_targets()` / `gain(s)` / `tie_margin` / `bonus_max` 那整套软偏置模型；
-- 与当前 SWOD 的 held bitmap 接口天然对接；
-- 改动集中在 victim selection 路径，验证成本低；
-- 更贴合“窗口中还有 segment 就优先从这里选”的约束。
+其筛选依据直接复用 SWOD 已维护的 segment 侧摘要：
 
-### 5.3 运行语义
+- `pend_blks`：该 segment 内当前可见 pending discard 块数
+- `nr_cmds`：该 segment 的碎片度
+- `oldest_jiffies`：这些 pending fragment 的年龄
+- `hold_segmap / nr_held_groups`：该 segment 是否属于 held target，以及系统当前是否还有 held windows
 
-本版 WCE 的语义可以概括为：
+再叠加：
+
+- non-target only
+- skip hot data
+- age threshold
+- tiny fragment threshold
+
+SFI 的目标不是帮助 held window completion，而是：
+
+- 不去动 held windows；
+- 尽量少让其他地方继续长出新的 tiny discard；
+- 作为 WCE 主路径之外的一个 source-side shaping 辅助动作。
+
+### 5.4 为什么这次不把 SSR 当主策略
+
+这次设计里没有把 SSR 作为主路径，原因是当前 F2FS 代码条件下，`f2fs_need_SSR()` 在 `f2fs_lfs_mode(sbi)` 下直接返回 `false`。
+
+因此，在当前代码基线下：
+
+- SSR 并不是一个可以自然承接这版 shaping 设计的主通路；
+- 更现实的落点是：保持 WCE 作为 completion 主路径，再通过一个非常窄的 fragment-IPU 例外去抑制 non-target zone 的 tiny fragment 继续增长。
+
+### 5.5 运行语义
+
+本版最终语义可以概括为：
 
 1. SWOD 继续负责 `identify / hold / skip / release`；
-2. WCE 不负责直接 issue discard；
-3. WCE 也不改写写入路径；
-4. WCE 只在 GC victim selection 时，把 SWOD 已经 hold 的窗口当成优先目标集；
-5. 真正的 discard materialization 仍交给 stock F2FS 的 checkpoint / prefree / issue path。
+2. WCE 在 held windows 上优先做 completion；
+3. SFI 只在 non-target zone 上做极窄的 fragment-IPU 辅助；
+4. 三者都不直接 issue discard，也不直接伪造大 discard；
+5. 真正的 discard materialization 仍交给 stock F2FS。
 
 因此，这一版形成的是：
 
-> **SWOD 保住机会窗口，WCE 优先清掉窗口里的 residual live blocks，stock F2FS 负责最终自然 materialize 成更连续的 discard。**
+> **SWOD 保住机会窗口，WCE 优先清掉 held windows 里的 residual live blocks，SFI 只在 non-target zone 上抑制新的 tiny fragment 继续形成，最终仍由 stock F2FS 自然 materialize 成更连续的 discard。**
 
 ## 6. 代码改动概述
 
@@ -334,11 +378,16 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `f2fs_swod_range_held()`
 - `f2fs_swod_seg_held()`
 
-同时在 `struct swod_ctrl` 中增加了 WCE 统计项：
+同时在 `struct swod_ctrl` 中增加了 WCE / SFI 统计项：
 
 - `gc_pick_bg_cnt`
 - `gc_pick_fg_cnt`
 - `gc_fallback_cnt`
+- `frag_ipu_pick_cnt`
+- `frag_ipu_skip_target_cnt`
+- `frag_ipu_skip_hot_cnt`
+- `frag_ipu_skip_age_cnt`
+- `frag_ipu_skip_shape_cnt`
 
 #### `fs/f2fs/swod.c`
 实现 SWOD 核心逻辑，包括：
@@ -349,6 +398,7 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - hold/release 状态维护
 - issue 路径 skip 判定
 - 面向 WCE 的 held target 查询接口
+- 面向 SFI 的 fragment-IPU advisory selector
 
 ---
 
@@ -379,10 +429,18 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
    - `swod_gc_bg_enable`
    - `swod_gc_fg_enable`
 
+4. 在 `struct discard_cmd_control` 中增加 SFI 开关与阈值：
+   - `swod_frag_ipu_enable`
+   - `swod_frag_ipu_max_pend_blks`
+   - `swod_frag_ipu_min_cmds`
+   - `swod_frag_ipu_age_ms`
+   - `swod_frag_ipu_skip_hot`
+
 作用：
 
 - 将 SWOD 作为 discard 子系统的一层附加状态，绑定到 `discard_cmd_control` 生命周期；
-- 允许在运行时单独控制 target-first WCE 是否生效，以及 BG/FG GC 是否参与。
+- 允许在运行时单独控制 target-first WCE 是否生效，以及 BG/FG GC 是否参与；
+- 允许在 non-target zone 上启用一个很窄的 fragment-IPU 辅助路径。
 
 ---
 
@@ -443,7 +501,7 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 主要改动：
 
-新增 SWOD / WCE 的 sysfs 参数与统计：
+新增 SWOD / WCE / SFI 的 sysfs 参数与统计：
 
 ##### 可写参数
 - `swod_enable`
@@ -458,6 +516,11 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `swod_completion_enable`
 - `swod_gc_bg_enable`
 - `swod_gc_fg_enable`
+- `swod_frag_ipu_enable`
+- `swod_frag_ipu_max_pend_blks`
+- `swod_frag_ipu_min_cmds`
+- `swod_frag_ipu_age_ms`
+- `swod_frag_ipu_skip_hot`
 
 ##### 只读统计
 - `swod_held_groups`
@@ -469,6 +532,11 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - `swod_gc_pick_bg_cnt`
 - `swod_gc_pick_fg_cnt`
 - `swod_gc_fallback_cnt`
+- `swod_frag_ipu_pick_cnt`
+- `swod_frag_ipu_skip_target_cnt`
+- `swod_frag_ipu_skip_hot_cnt`
+- `swod_frag_ipu_skip_age_cnt`
+- `swod_frag_ipu_skip_shape_cnt`
 
 说明：
 
@@ -552,24 +620,26 @@ SWOD 的动作是：
 
 ---
 
-## 9. 当前限制
+## 9. 当前版本的边界与特性
 
-本实现已经从 SWOD-only 发展到 **SWOD + target-first WCE**，但当前仍有一些有意保守或尚未完成的部分：
+当前版本是这轮 discard 研究设计的定稿版，其边界如下：
 
 1. 每个 group 最多只保留一个 held 子窗口；
 2. 不显式建模 latent invalid；
 3. 仅对完全落在 held 子窗口内部的命令做 skip；
-4. 当前 WCE 采用 target-first 过滤，而不是 `gain(s)` / tie-break 软偏置；
-5. `f2fs_swod_range_held()` 目前只基于 held bitmap 做范围命中判断，还没有更细的 per-window completion score；
-6. 还没有接入 target-zone keep-OPU / non-target IPU-SSR bias；
-7. 不主动提交“materialized”大 discard，而是交由 stock F2FS 自然处理。
+4. WCE 采用 target-first completion，而不是 `gain(s)` / tie-break 软偏置；
+5. `f2fs_swod_range_held()` 目前只基于 held bitmap 做范围命中判断；
+6. SFI 只在 LFS 场景、且存在 held windows 时生效；
+7. SFI 只针对 non-target、tiny、fragmented、aged、non-hot 旧碎片；
+8. SSR 不作为当前版本的主路径，因为当前代码基线下 `f2fs_need_SSR()` 在 `f2fs_lfs_mode(sbi)` 下直接返回 `false`；
+9. 不主动提交“materialized”大 discard，而是交由 stock F2FS 自然处理。
 
-这些限制是为了：
+这些边界是有意保留的，目的在于：
 
-- 先形成最小闭环；
-- 降低内核侵入性；
-- 避免状态冲突；
-- 使机制更容易验证与消融。
+- 让主路径聚焦在 held-window completion；
+- 让辅路径只做很窄的 fragment 抑制；
+- 保持和 stock F2FS 的边界清晰；
+- 便于实验分析每一条路径的真实效果。
 
 ---
 
@@ -582,6 +652,11 @@ SWOD 的动作是：
 - `swod_completion_enable`
 - `swod_gc_bg_enable`
 - `swod_gc_fg_enable`
+- `swod_frag_ipu_enable`
+- `swod_frag_ipu_max_pend_blks`
+- `swod_frag_ipu_min_cmds`
+- `swod_frag_ipu_age_ms`
+- `swod_frag_ipu_skip_hot`
 - `swod_held_groups`
 - `swod_hold_cnt`
 - `swod_skip_cnt`
@@ -590,6 +665,11 @@ SWOD 的动作是：
 - `swod_gc_pick_bg_cnt`
 - `swod_gc_pick_fg_cnt`
 - `swod_gc_fallback_cnt`
+- `swod_frag_ipu_pick_cnt`
+- `swod_frag_ipu_skip_target_cnt`
+- `swod_frag_ipu_skip_hot_cnt`
+- `swod_frag_ipu_skip_age_cnt`
+- `swod_frag_ipu_skip_shape_cnt`
 
 ### 原有 F2FS/Discard 指标
 - `pending_discard`
@@ -608,21 +688,25 @@ SWOD 的动作是：
 
 - WCE 是否真的在 held target 上 pick 到 victim；
 - fallback 是否过多；
-- held windows 的 residual live 是否下降得更快。
+- held windows 的 residual live 是否下降得更快；
+- SFI 是否只在 non-target old fragments 上被放行；
+- SFI 是否在减少 tiny fragment 的继续增长。
 
 ---
 
-## 11. 后续扩展方向
+## 11. 本文档的用途
 
-在当前 target-first WCE 已经落地的基础上，后续建议按以下顺序推进：
+当前版本已经记录了这轮 discard 研究设计的最终实现口径：
 
-1. 先验证 target-first WCE 的收益、代价与 fallback 频率；
-2. 视实验结果决定是否把 target-first 进一步收敛为 `gain(s)` / tie-break 版本，或保留为主方案；
-3. 实现 target-zone keep-OPU 规则；
-4. 实现 non-target IPU / SSR bias；
-5. 在 group 内支持多个不重叠 held 子窗口；
-6. 增加更细粒度的 completion 统计；
-7. 增加针对 fio 与 tpcc/MySQL 等真实负载的在线 window 演化观测。
+- 主路径是 WCE completion；
+- 辅路径是 non-target zone 上的 Selective Fragment IPU；
+- materialization 仍交给 stock F2FS。
+
+后续若继续修改，应视为新一轮演进，而不是本轮设计定义的一部分。阅读本文件即可快速恢复：
+
+- 这版设计为什么这样划分；
+- 每条路径当前在代码中如何实现；
+- 这版机制的目标边界与预期功效。
 
 ---
 
@@ -630,6 +714,11 @@ SWOD 的动作是：
 
 当前版本的本质不是“更激进地发出更长 discard”，而是：
 
-> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再由 target-first WCE 优先围绕这些 held windows 清理 residual live blocks，最终仍由 stock F2FS 自然完成 materialization 与 issue。
+> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再由 WCE 优先围绕 held windows 清理 residual live blocks，同时只在 non-target zone 上用一个很窄的 fragment-IPU 例外去抑制新的 tiny fragment 继续增长，最终仍由 stock F2FS 自然完成 materialization 与 issue。
 
-通过这一设计，系统已经从“仅基于当前请求的被动 discard 消费”，推进到“先保留机会，再围绕目标窗口做最小补全闭环”的方向，同时又尽可能保持与 stock F2FS 架构兼容、实现轻量、边界清晰。
+通过这一设计，系统已经形成了一个清晰的最终版闭环：
+
+- **SWOD** 负责识别并保住机会；
+- **WCE** 负责把 held windows 尽快推向可 materialize 状态；
+- **SFI** 负责在不碰 held target 的前提下，减少 non-target zone 继续产生更多 tiny discard；
+- **stock F2FS** 负责真正的连续 discard materialization 与 issue。

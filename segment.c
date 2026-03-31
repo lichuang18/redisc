@@ -2311,6 +2311,12 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 	dcc->swod_completion_enable = 0;
 	dcc->swod_gc_bg_enable = 1;
 	dcc->swod_gc_fg_enable = 1;
+
+	dcc->swod_frag_ipu_enable = 0;
+	dcc->swod_frag_ipu_max_pend_blks = 32; // 只盯着very small fragment
+	dcc->swod_frag_ipu_min_cmds = 2; // 至少是碎的
+	dcc->swod_frag_ipu_age_ms = 5000;// 先只碰更老的
+	dcc->swod_frag_ipu_skip_hot = 1;// 热数据默认不碰
 	dcc->swod = NULL;
 
 	init_waitqueue_head(&dcc->discard_wait_queue);
