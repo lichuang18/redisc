@@ -403,8 +403,8 @@ struct discard_cmd_control {
 	atomic_t issued_discard;		/* # of issued discard */
 	atomic_t queued_discard;		/* # of queued discard */
 	atomic_t discard_cmd_cnt;		/* # of cached cmd count */
-	unsigned long long discard_back_merge_cnt;	/* # of back merges */
-	unsigned long long discard_front_merge_cnt;	/* # of front merges */
+	unsigned long long discard_back_only_merge_cnt;	/* # of back merges */
+	unsigned long long discard_front_only_merge_cnt;	/* # of front merges */
 	unsigned long long discard_both_merge_cnt;	/* # of both merges */
 	struct rb_root_cached root;		/* root of discard rb-tree */
 	bool rbtree_check;			/* config for consistence check */
@@ -416,6 +416,7 @@ struct discard_cmd_control {
 	unsigned int swod_lres_thr_bp;         /* 0..10000 */ // 万分比 9000标识0.9
 	unsigned int swod_hold_min_ms;
 	unsigned int swod_hold_max_ms;
+	unsigned int swod_hold_scale_bp;        /* 10000 = 1.0x */
 	unsigned int swod_cmd_pressure;        /* pending cmd threshold */
 	unsigned int swod_blk_pressure;        /* undiscard_blks threshold */
 	unsigned int swod_max_held_groups;     /* bound waiting scope */
@@ -3740,8 +3741,8 @@ struct f2fs_stat_info {
 	int nr_discarding, nr_discarded;
 	int nr_discard_cmd;
 	unsigned int undiscard_blks;
-	unsigned long long discard_back_merge_cnt;
-	unsigned long long discard_front_merge_cnt;
+	unsigned long long discard_back_only_merge_cnt;
+	unsigned long long discard_front_only_merge_cnt;
 	unsigned long long discard_both_merge_cnt;
 	int nr_issued_ckpt, nr_total_ckpt, nr_queued_ckpt;
 	unsigned int cur_ckpt_time, peak_ckpt_time;

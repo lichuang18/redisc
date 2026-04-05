@@ -107,19 +107,18 @@ static inline bool swod_regime_blocked(struct f2fs_sb_info *sbi,
 		return true;
 
 	/* stock discard thread already treats this as aggressive regime */
-    if (utilization(sbi) > DEF_DISCARD_URGENT_UTIL) 
+	if (utilization(sbi) > DEF_DISCARD_URGENT_UTIL)
 		return true;
 
 	if (!f2fs_available_free_memory(sbi, DISCARD_CACHE))
 		return true;
 
-	if ((unsigned int)atomic_read(&dcc->discard_cmd_cnt) >
-	    dcc->swod_cmd_pressure)
-		return true;
-
-	if (dcc->undiscard_blks > dcc->swod_blk_pressure)
-		return true;
-
+	/*
+	 * Do not block new SWOD candidate evaluation just because backlog is large.
+	 * High discard_cmd_cnt / undiscard_blks is exactly when shaping is useful.
+	 * Existing held ranges are still released by the issue thread when the
+	 * runtime policy switches to a bypass regime.
+	 */
 	return false;
 }
 
@@ -140,6 +139,9 @@ static unsigned int swod_calc_hold_ms(struct f2fs_sb_info *sbi,
 
 	if (dcc->swod_lres_thr_bp > lres_bp)
 		hold += (dcc->swod_lres_thr_bp - lres_bp) / 100;
+
+	if (dcc->swod_hold_scale_bp)
+		hold = div_u64((u64)hold * dcc->swod_hold_scale_bp, SWOD_BP_ONE);
 
 	if (hold < dcc->swod_hold_min_ms)
 		hold = dcc->swod_hold_min_ms;
@@ -164,6 +166,8 @@ static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 	g->state = SWOD_G_NORMAL;
 	g->hold_off = 0;
 	g->hold_len = 0;
+	g->hold_qbp = 0;
+	g->hold_lbp = 0;
 	g->hold_until = 0;
 	g->last_eval = jiffies;
 
@@ -267,10 +271,6 @@ static void swod_rebuild_groups_locked(struct f2fs_sb_info *sbi,
 		sw->seg_hint[g].oldest_jiffies = 0;
 	}
 
-	/* clear group state first; held decision will be rebuilt below */
-	for (g = gid0; g <= gid1; g++)
-		swod_clear_group_locked(sbi, g);
-
 	if (start_seg >= end_seg)
 		return;
 
@@ -332,6 +332,7 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 		return;
 
 	if (swod_regime_blocked(sbi, dcc, NULL)) {
+		atomic64_inc(&sw->eval_blocked_cnt);
 		if (g->state == SWOD_G_HELD)
 			swod_release_group_locked(sbi, gid, SWOD_REL_PRESSURE);
 		return;
@@ -358,9 +359,6 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 			return;
 		}
 	}
-
-	if (sw->nr_held_groups >= dcc->swod_max_held_groups)
-		return;
 
 	for (i = 0; i < n; i++) {
 		qpref[i + 1] = qpref[i] + sw->seg_hint[first + i].pend_blks;
@@ -413,12 +411,49 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 		}
 	}
 
-	if (!found)
+	if (!found) {
+		atomic64_inc(&sw->eval_no_candidate_cnt);
 		return;
+	}
+
+	if (sw->nr_held_groups >= dcc->swod_max_held_groups) {
+		unsigned int victim_gid = UINT_MAX;
+		struct swod_group_hint *victim = NULL;
+
+		for (i = 0; i < sw->nr_groups; i++) {
+			struct swod_group_hint *cand = &sw->grp_hint[i];
+
+			if (cand->state != SWOD_G_HELD)
+				continue;
+			if (!victim || cand->hold_qbp < victim->hold_qbp ||
+			    (cand->hold_qbp == victim->hold_qbp &&
+			     cand->hold_lbp > victim->hold_lbp) ||
+			    (cand->hold_qbp == victim->hold_qbp &&
+			     cand->hold_lbp == victim->hold_lbp &&
+			     cand->hold_len < victim->hold_len)) {
+				victim_gid = i;
+				victim = cand;
+			}
+		}
+
+		if (!victim)
+			return;
+		if (best_qbp < victim->hold_qbp)
+			return;
+		if (best_qbp == victim->hold_qbp && best_lbp > victim->hold_lbp)
+			return;
+		if (best_qbp == victim->hold_qbp && best_lbp == victim->hold_lbp &&
+		    best_len <= victim->hold_len)
+			return;
+
+		swod_release_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
+	}
 
 	g->state = SWOD_G_HELD;
 	g->hold_off = best_off;
 	g->hold_len = best_len;
+	g->hold_qbp = best_qbp;
+	g->hold_lbp = best_lbp;
 	g->hold_until = now + msecs_to_jiffies(
 		swod_calc_hold_ms(sbi, best_len, best_qbp, best_lbp));
 	g->last_eval = now;
@@ -540,15 +575,13 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct swod_ctrl *sw = dcc->swod;
-	struct swod_group_hint *g;
-	unsigned int seg0, seg1, gid0, gid1;
-	unsigned int held_first, held_last;
+	unsigned int seg0, seg1, gid0, gid1, gid;
+	bool saw_held = false;
 
 	if (!swod_enabled(dcc))
 		return false;
 
-	if (swod_regime_blocked(sbi, dcc, dpolicy))
-		return false;
+	atomic64_inc(&sw->skip_check_cnt);
 
 	if (dc->state != D_PREP)
 		return false;
@@ -558,33 +591,45 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 	gid0 = swod_gid(sw, seg0);
 	gid1 = swod_gid(sw, seg1);
 
-	/* 首版不强拆跨 group 命令 */
-	if (gid0 != gid1)
-		return false;
+	for (gid = gid0; gid <= gid1; gid++) {
+		struct swod_group_hint *g = &sw->grp_hint[gid];
+		unsigned int held_first, held_last;
 
-	g = &sw->grp_hint[gid0];
-	if (g->state != SWOD_G_HELD)
-		return false;
+		if (g->state != SWOD_G_HELD)
+			continue;
+		saw_held = true;
 
-	if (time_after_eq(now, g->hold_until)) {
-		swod_release_group_locked(sbi, gid0, SWOD_REL_TIMEOUT);
-		return false;
+		if (time_after_eq(now, g->hold_until)) {
+			atomic64_inc(&sw->skip_miss_timeout_cnt);
+			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
+			continue;
+		}
+
+		if (swod_window_ready_locked(sbi, gid)) {
+			atomic64_inc(&sw->skip_miss_success_cnt);
+			swod_release_group_locked(sbi, gid, SWOD_REL_SUCCESS);
+			continue;
+		}
+
+		held_first = swod_group_first_seg(sw, gid) + g->hold_off;
+		held_last  = held_first + g->hold_len - 1;
+
+		/*
+		 * Hold any cmd overlapping a held sub-window.
+		 * This covers cross-group cmds and partial overlaps too.
+		 */
+		if (seg1 < held_first || seg0 > held_last) {
+			atomic64_inc(&sw->skip_miss_overlap_cnt);
+			continue;
+		}
+
+		atomic64_inc(&sw->skip_cnt);
+		return true;
 	}
 
-	if (swod_window_ready_locked(sbi, gid0)) {
-		swod_release_group_locked(sbi, gid0, SWOD_REL_SUCCESS);
-		return false;
-	}
-
-	held_first = swod_group_first_seg(sw, gid0) + g->hold_off;
-	held_last  = held_first + g->hold_len - 1;
-
-	/* 只 skip 完全落在 held 子窗口内部的命令 */
-	if (seg0 < held_first || seg1 > held_last)
-		return false;
-
-	atomic64_inc(&sw->skip_cnt);
-	return true;
+	if (!saw_held)
+		atomic64_inc(&sw->skip_miss_noheld_cnt);
+	return false;
 }
 
 static void __f2fs_swod_release_all_locked(struct f2fs_sb_info *sbi,
@@ -613,6 +658,28 @@ void f2fs_swod_release_all(struct f2fs_sb_info *sbi,
 
 	mutex_lock(&dcc->cmd_lock);
 	__f2fs_swod_release_all_locked(sbi, why);
+	mutex_unlock(&dcc->cmd_lock);
+}
+
+void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int gid;
+
+	if (!swod_enabled(dcc))
+		return;
+
+	sw = dcc->swod;
+	mutex_lock(&dcc->cmd_lock);
+	for (gid = 0; gid < sw->nr_groups; gid++) {
+		struct swod_group_hint *g = &sw->grp_hint[gid];
+
+		if (g->state != SWOD_G_HELD)
+			continue;
+		if (time_after_eq(now, g->hold_until))
+			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
+	}
 	mutex_unlock(&dcc->cmd_lock);
 }
 

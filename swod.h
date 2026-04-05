@@ -29,6 +29,8 @@ struct swod_group_hint {
 	u8 state;                        /* NORMAL / HELD */
 	u16 hold_off;                    /* offset inside group */
 	u16 hold_len;                    /* nr segs of held sub-window */
+	u16 hold_qbp;                    /* qcov score of held window */
+	u16 hold_lbp;                    /* lres score of held window */
 	unsigned long hold_until;        /* jiffies deadline */
 	unsigned long last_eval;         /* optional debug */
 };
@@ -47,6 +49,13 @@ struct swod_ctrl {
 
 	atomic64_t hold_cnt;
 	atomic64_t skip_cnt;
+	atomic64_t skip_check_cnt;
+	atomic64_t skip_miss_noheld_cnt;
+	atomic64_t skip_miss_timeout_cnt;
+	atomic64_t skip_miss_success_cnt;
+	atomic64_t skip_miss_overlap_cnt;
+	atomic64_t eval_blocked_cnt;
+	atomic64_t eval_no_candidate_cnt;
 	atomic64_t success_release_cnt;
 	atomic64_t timeout_release_cnt;
 	atomic64_t pressure_release_cnt;
@@ -75,6 +84,7 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 
 void f2fs_swod_release_all(struct f2fs_sb_info *sbi,
 			   enum swod_release_reason why);
+void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now);
 
 bool f2fs_swod_has_held(struct f2fs_sb_info *sbi);
 bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,

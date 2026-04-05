@@ -119,6 +119,12 @@ static void update_general_status(struct f2fs_sb_info *sbi)
 		si->nr_discard_cmd =
 			atomic_read(&SM_I(sbi)->dcc_info->discard_cmd_cnt);
 		si->undiscard_blks = SM_I(sbi)->dcc_info->undiscard_blks;
+		si->discard_back_only_merge_cnt =
+			SM_I(sbi)->dcc_info->discard_back_only_merge_cnt;
+		si->discard_front_only_merge_cnt =
+			SM_I(sbi)->dcc_info->discard_front_only_merge_cnt;
+		si->discard_both_merge_cnt =
+			SM_I(sbi)->dcc_info->discard_both_merge_cnt;
 	}
 	si->nr_issued_ckpt = atomic_read(&sbi->cprc_info.issued_ckpt);
 	si->nr_total_ckpt = atomic_read(&sbi->cprc_info.total_ckpt);
@@ -517,12 +523,15 @@ static int stat_show(struct seq_file *s, void *v)
 		seq_printf(s, "  - IO_R (Data: %4d, Node: %4d, Meta: %4d\n",
 			   si->nr_rd_data, si->nr_rd_node, si->nr_rd_meta);
 		seq_printf(s, "  - IO_W (CP: %4d, Data: %4d, Flush: (%4d %4d %4d), "
-			"Discard: (%4d %4d)) cmd: %4d undiscard:%4u\n",
+			"Discard: (%4d %4d)) cmd: %4d undiscard:%4u merge:(b:%llu f:%llu bf:%llu)\n",
 			   si->nr_wb_cp_data, si->nr_wb_data,
 			   si->nr_flushing, si->nr_flushed,
 			   si->flush_list_empty,
 			   si->nr_discarding, si->nr_discarded,
-			   si->nr_discard_cmd, si->undiscard_blks);
+			   si->nr_discard_cmd, si->undiscard_blks,
+			   si->discard_back_only_merge_cnt,
+			   si->discard_front_only_merge_cnt,
+			   si->discard_both_merge_cnt);
 		seq_printf(s, "  - inmem: %4d, atomic IO: %4d (Max. %4d), "
 			"volatile IO: %4d (Max. %4d)\n",
 			   si->inmem_pages, si->aw_cnt, si->max_aw_cnt,

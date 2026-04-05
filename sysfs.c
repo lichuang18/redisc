@@ -323,6 +323,90 @@ static ssize_t swod_pressure_release_cnt_show(struct f2fs_attr *a,
 		(unsigned long long)atomic64_read(
 			&dcc->swod->pressure_release_cnt));
 }
+static ssize_t swod_skip_check_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_check_cnt));
+}
+
+static ssize_t swod_skip_miss_noheld_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_miss_noheld_cnt));
+}
+
+static ssize_t swod_skip_miss_timeout_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_miss_timeout_cnt));
+}
+
+static ssize_t swod_skip_miss_success_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_miss_success_cnt));
+}
+
+static ssize_t swod_skip_miss_overlap_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->skip_miss_overlap_cnt));
+}
+
+static ssize_t swod_eval_blocked_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->eval_blocked_cnt));
+}
+
+static ssize_t swod_eval_no_candidate_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->eval_no_candidate_cnt));
+}
+
 // swod over
 #define SWOD_COUNTER_SHOW(_name, _field)				 \
 static ssize_t _name##_show(struct f2fs_attr *a,			 \
@@ -1013,6 +1097,13 @@ F2FS_GENERAL_RO_ATTR(swod_skip_cnt);
 F2FS_GENERAL_RO_ATTR(swod_success_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_timeout_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_pressure_release_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_check_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_miss_noheld_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_miss_timeout_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_miss_success_cnt);
+F2FS_GENERAL_RO_ATTR(swod_skip_miss_overlap_cnt);
+F2FS_GENERAL_RO_ATTR(swod_eval_blocked_cnt);
+F2FS_GENERAL_RO_ATTR(swod_eval_no_candidate_cnt);
 
 //sfi
 F2FS_GENERAL_RO_ATTR(swod_frag_ipu_pick_cnt);
@@ -1175,6 +1266,13 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_success_release_cnt),
 	ATTR_LIST(swod_timeout_release_cnt),
 	ATTR_LIST(swod_pressure_release_cnt),
+	ATTR_LIST(swod_skip_check_cnt),
+	ATTR_LIST(swod_skip_miss_noheld_cnt),
+	ATTR_LIST(swod_skip_miss_timeout_cnt),
+	ATTR_LIST(swod_skip_miss_success_cnt),
+	ATTR_LIST(swod_skip_miss_overlap_cnt),
+	ATTR_LIST(swod_eval_blocked_cnt),
+	ATTR_LIST(swod_eval_no_candidate_cnt),
 	
 	// sfi
 	ATTR_LIST(swod_frag_ipu_enable),

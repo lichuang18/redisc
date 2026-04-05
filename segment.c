@@ -1123,8 +1123,8 @@ static void f2fs_submit_discard_endio(struct bio *bio)
 
 			printk(KERN_INFO "f2fs_discard: policy=%s, start=%u, len=%u, latency=%llu us, merge(b:%llu f:%llu bf:%llu)\n",
 			       policy_str, dc->start, dc->orig_len, latency_ns / 1000,
-			       dcc->discard_back_merge_cnt,
-			       dcc->discard_front_merge_cnt,
+			       dcc->discard_back_only_merge_cnt,
+			       dcc->discard_front_only_merge_cnt,
 			       dcc->discard_both_merge_cnt);
 		}
 		complete_all(&dc->wait);
@@ -1172,7 +1172,7 @@ static void __init_discard_policy(struct f2fs_sb_info *sbi,
 	dpolicy->ordered = false;
 	dpolicy->granularity = granularity;
 
-	dpolicy->max_requests = DEF_MAX_DISCARD_REQUEST;
+	dpolicy->max_requests = 8;
 	dpolicy->io_aware_gran = MAX_PLIST_NUM;
 	// dpolicy->io_aware_gran = granularity;
 	dpolicy->timeout = false;
@@ -1481,7 +1481,6 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 							max_discard_blocks)) {
 			prev_dc->di.len += di.len;
 			dcc->undiscard_blks += di.len;
-			dcc->discard_back_merge_cnt++;
 			back_merged = true;
 			__relocate_discard_cmd(dcc, prev_dc);
 			di = prev_dc->di;
@@ -1497,7 +1496,6 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 			next_dc->di.len += di.len;
 			next_dc->di.start = di.start;
 			dcc->undiscard_blks += di.len;
-			dcc->discard_front_merge_cnt++;
 			front_merged = true;
 			__relocate_discard_cmd(dcc, next_dc);
 			if (tdc)
@@ -1507,6 +1505,10 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 
 		if (back_merged && front_merged)
 			dcc->discard_both_merge_cnt++;
+		else if (back_merged)
+			dcc->discard_back_only_merge_cnt++;
+		else if (front_merged)
+			dcc->discard_front_only_merge_cnt++;
 
 		if (!merged) {
 			__insert_discard_tree(sbi, bdev, di.lstart, di.start,
@@ -1888,16 +1890,25 @@ static int issue_discard_thread(void *data)
 	set_freezable();
 
 	do {
-		if (sbi->gc_mode == GC_URGENT_HIGH ||
-			!f2fs_available_free_memory(sbi, DISCARD_CACHE))
+		bool urgent_force = sbi->gc_mode == GC_URGENT_HIGH;
+
+			
+		if (urgent_force ||
+		    !f2fs_available_free_memory(sbi, DISCARD_CACHE))
 			__init_discard_policy(sbi, &dpolicy, DPOLICY_FORCE, 1);
 		else
 			__init_discard_policy(sbi, &dpolicy, DPOLICY_BG,
-						dcc->discard_granularity);
-		
-		/* SWOD only works in normal background regime */
-		if (dpolicy.type != DPOLICY_BG ||
-		    dpolicy.granularity == 1)
+					     dcc->discard_granularity);
+
+		/*
+		 * Keep SWOD holds alive in urgent-force mode so
+		 * f2fs_swod_should_skip_locked() can still delay held ranges.
+		 *
+		 * Non-urgent force/pressure paths still release all held groups,
+		 * because those regimes are treated as bypassing SWOD.
+		 */
+		if ((dpolicy.type != DPOLICY_BG || dpolicy.granularity == 1) &&
+		    !urgent_force)
 			f2fs_swod_release_all(sbi, SWOD_REL_PRESSURE);
 		
 		// pr_info("normal wait_ms: %u, cmd cnt: %u\n",wait_ms,atomic_read(&dcc->discard_cmd_cnt));		
@@ -1934,6 +1945,7 @@ static int issue_discard_thread(void *data)
 		sb_start_intwrite(sbi->sb);
 
 		issued = __issue_discard_cmd(sbi, &dpolicy);
+		f2fs_swod_sweep_timeout(sbi, jiffies);
 		if (issued > 0) {
 			__wait_all_discard_cmd(sbi, &dpolicy);
 			wait_ms = dpolicy.min_interval;//50
@@ -2304,6 +2316,7 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 	dcc->swod_lres_thr_bp = 1000;
 	dcc->swod_hold_min_ms = 50;
 	dcc->swod_hold_max_ms = 300;
+		dcc->swod_hold_scale_bp = 10000;
 	dcc->swod_cmd_pressure = 4096;
 	dcc->swod_blk_pressure = 1 << 20;
 	dcc->swod_max_held_groups = 64;
