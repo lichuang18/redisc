@@ -5,12 +5,16 @@
 #include <linux/f2fs_fs.h>
 #include "f2fs.h"
 
-#define SWOD_BP_ONE          10000U
-#define SWOD_MAX_WIN_SEGS    16
+#define SWOD_BP_ONE                10000U
+#define SWOD_MAX_WIN_SEGS          16
+#define SWOD_WCE_PARK_MIN_MS       500U
+#define SWOD_WCE_PARK_MAX_MS       2000U
+#define SWOD_WCE_PARK_LRES_CAP_BP  2000U
 
 enum swod_group_state {
 	SWOD_G_NORMAL = 0,
 	SWOD_G_HELD   = 1,
+	SWOD_G_PARKED = 2,
 };
 
 enum swod_release_reason {
@@ -26,12 +30,14 @@ struct swod_seg_hint {
 };
 
 struct swod_group_hint {
-	u8 state;                        /* NORMAL / HELD */
+	u8 state;                        /* NORMAL / HELD / PARKED */
 	u16 hold_off;                    /* offset inside group */
 	u16 hold_len;                    /* nr segs of held sub-window */
-	u16 hold_qbp;                    /* qcov score of held window */
-	u16 hold_lbp;                    /* lres score of held window */
-	unsigned long hold_until;        /* jiffies deadline */
+	u16 hold_qbp;                    /* qcov score of held/parked window */
+	u16 hold_lbp;                    /* lres score of held/parked window */
+	u32 park_score;                  /* priority once handed to WCE */
+	unsigned long hold_until;        /* jiffies deadline for SWOD hold */
+	unsigned long park_until;        /* jiffies deadline for WCE parked hold */
 	unsigned long last_eval;         /* optional debug */
 };
 
@@ -40,12 +46,14 @@ struct swod_ctrl {
 	unsigned int win_segs;
 	unsigned int nr_groups;
 	unsigned int nr_held_groups;
+	unsigned int nr_parked_groups;
 
 	struct swod_seg_hint *seg_hint;      /* [nr_main_segs] */
 	struct swod_group_hint *grp_hint;    /* [nr_groups] */
 
 	/* fast path + interface to motive-2 mechanism */
-	unsigned long *hold_segmap;          /* bitmap over segno */
+	unsigned long *hold_segmap;          /* bitmap over segno for SWOD-held */
+	unsigned long *park_segmap;          /* bitmap over segno for WCE-parked */
 
 	atomic64_t hold_cnt;
 	atomic64_t skip_cnt;
@@ -59,11 +67,11 @@ struct swod_ctrl {
 	atomic64_t success_release_cnt;
 	atomic64_t timeout_release_cnt;
 	atomic64_t pressure_release_cnt;
-    // for wce
-    atomic64_t gc_pick_bg_cnt;
+	/* for wce */
+	atomic64_t gc_pick_bg_cnt;
 	atomic64_t gc_pick_fg_cnt;
 	atomic64_t gc_fallback_cnt;
-    /* ---------- selective fragment-IPU stats ---------- */
+	/* ---------- selective fragment-IPU stats ---------- */
 	atomic64_t frag_ipu_pick_cnt;
 	atomic64_t frag_ipu_skip_target_cnt;
 	atomic64_t frag_ipu_skip_hot_cnt;
@@ -89,6 +97,11 @@ void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now);
 bool f2fs_swod_has_held(struct f2fs_sb_info *sbi);
 bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
 			  unsigned int nr_segs);
+
+bool f2fs_swod_has_wce_target(struct f2fs_sb_info *sbi);
+bool f2fs_swod_range_wce_target(struct f2fs_sb_info *sbi,
+				unsigned int segno,
+				unsigned int nr_segs);
 
 bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno);
 

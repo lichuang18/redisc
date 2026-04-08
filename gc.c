@@ -377,7 +377,7 @@ static inline bool swod_wce_match(struct f2fs_sb_info *sbi,
 				  unsigned int segno,
 				  unsigned int nr_segs)
 {
-	return f2fs_swod_range_held(sbi, segno, nr_segs);
+	return f2fs_swod_range_wce_target(sbi, segno, nr_segs);
 }
 
 static inline void swod_wce_account_pick(struct f2fs_sb_info *sbi, int gc_type)
@@ -701,7 +701,7 @@ static int get_victim_by_default(struct f2fs_sb_info *sbi,
 	// wce入口条件 
 	swod_target_pass = (alloc_mode == LFS) &&
 			swod_wce_enabled(sbi, gc_type) &&
-			f2fs_swod_has_held(sbi);
+			f2fs_swod_has_wce_target(sbi);
 
 retry:
 	select_policy(sbi, gc_type, type, &p);
@@ -787,7 +787,8 @@ retry:
 		}
 
 		p.offset = segno + p.ofs_unit;
-		nsearched++;
+		if (!swod_target_pass)
+			nsearched++;
 
 #ifdef CONFIG_F2FS_CHECK_FS
 		/*
@@ -827,7 +828,7 @@ retry:
 		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
 			goto next;
 
-		// 当 swod_target_pass == true 时，只有真正命中 held target 的候选才消耗搜索预算
+		// 当 swod_target_pass == true 时，只有真正命中 WCE 目标的候选才消耗搜索预算
 		if (swod_target_pass) {
 			if (!swod_wce_match(sbi, segno, p.ofs_unit))
 				goto next;

@@ -1,31 +1,60 @@
 #!/bin/bash
-BASE=/sys/fs/ef2fs/nvme2n1
-OUT=swod_metrics.csv
-INTERVAL=1
+BASE=${BASE:-/sys/fs/ef2fs/nvme2n1}
+STATUS=${STATUS:-/sys/kernel/debug/ef2fs/status}
+OUT=${OUT:-swod_metrics.csv}
+INTERVAL=${INTERVAL:-1}
 DURATION=${1:-60}
 
-echo "ts,swod_held_groups,swod_skip_cnt,swod_hold_cnt,swod_success_release_cnt" > "$OUT"
+read_node() {
+    local p="$1"
+    if [ -r "$p" ]; then
+        cat "$p"
+    else
+        printf 'NA'
+    fi
+}
 
+read_back() {
+    if [ -r "$STATUS" ]; then
+        grep 'undiscard:' "$STATUS" | sed -n 's/.*undiscard:\([0-9]*\).*/\1/p'
+    else
+        printf 'NA'
+    fi
+}
+
+read_mem_available_kb() {
+    if [ -r /proc/meminfo ]; then
+        sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\)[[:space:]]*kB$/\1/p' /proc/meminfo
+    else
+        printf 'NA'
+    fi
+}
+
+printf '%s\n' "ts,swod_hold_cnt,swod_success_release_cnt,swod_timeout_release_cnt,swod_pressure_release_cnt,swod_held_groups,swod_skip_cnt,back,mem_available_kb,min_mem_available_kb" > "$OUT"
+
+min_mem_available_kb=
 end_ts=$(( $(date +%s) + DURATION ))
 
 while [ "$(date +%s)" -lt "$end_ts" ]; do
     ts=$(date '+%F %T')
 
-    held=$(cat "$BASE/swod_held_groups")
-    skip=$(cat "$BASE/swod_skip_cnt")
-    hold=$(cat "$BASE/swod_hold_cnt")
-    succ=$(cat "$BASE/swod_success_release_cnt")
-    # tout=$(cat "$BASE/swod_timeout_release_cnt")
-    # press=$(cat "$BASE/swod_pressure_release_cnt")
-    # skip_check=$(cat "$BASE/swod_skip_check_cnt")
-    # skip_noheld=$(cat "$BASE/swod_skip_miss_noheld_cnt")
-    # skip_timeout=$(cat "$BASE/swod_skip_miss_timeout_cnt")
-    # skip_success=$(cat "$BASE/swod_skip_miss_success_cnt")
-    # skip_overlap=$(cat "$BASE/swod_skip_miss_overlap_cnt")
-    # eval_blocked=$(cat "$BASE/swod_eval_blocked_cnt")
-    # eval_no_candidate=$(cat "$BASE/swod_eval_no_candidate_cnt")
+    hold=$(read_node "$BASE/swod_hold_cnt")
+    succ=$(read_node "$BASE/swod_success_release_cnt")
+    tout=$(read_node "$BASE/swod_timeout_release_cnt")
+    press=$(read_node "$BASE/swod_pressure_release_cnt")
+    held=$(read_node "$BASE/swod_held_groups")
+    skip=$(read_node "$BASE/swod_skip_cnt")
+    back=$(read_back)
+    mem_available_kb=$(read_mem_available_kb)
 
-    echo "${ts},${held},${skip},${hold},${succ}" >> "$OUT"
+    if [ "$mem_available_kb" != "NA" ]; then
+        if [ -z "$min_mem_available_kb" ] || [ "$mem_available_kb" -lt "$min_mem_available_kb" ]; then
+            min_mem_available_kb=$mem_available_kb
+        fi
+    fi
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$ts" "$hold" "$succ" "$tout" "$press" "$held" "$skip" "$back" "$mem_available_kb" "${min_mem_available_kb:-NA}" >> "$OUT"
     sleep "$INTERVAL"
 done
 

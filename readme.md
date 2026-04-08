@@ -721,4 +721,61 @@ SWOD 的动作是：
 - **SWOD** 负责识别并保住机会；
 - **WCE** 负责把 held windows 尽快推向可 materialize 状态；
 - **SFI** 负责在不碰 held target 的前提下，减少 non-target zone 继续产生更多 tiny discard；
-- **stock F2FS** 负责真正的连续 discard materialization 与 issue。
+- **stock F2FS** 负责真正的连续 discard materialization 与 issue
+
+
+
+4.8
+
+# WCE parked-handoff redesign notes
+
+## Goal
+Let WCE keep useful GC targets even when SWOD-held windows time out or are pressure-released before BG GC starts.
+
+## Design
+- Keep original SWOD hold-selection logic.
+- Add a second state `SWOD_G_PARKED` only for handoff.
+- On `SWOD_REL_TIMEOUT` or `SWOD_REL_PRESSURE`, try to convert a `HELD` window into a parked WCE target instead of dropping it immediately.
+- Parked windows still block overlapping discard commands, so pending discard ranges can continue to merge.
+- WCE target lookup sees `HELD || PARKED`.
+- SFI (`f2fs_swod_should_frag_ipu`) still only sees `HELD`, so parked targets do not broaden that policy.
+- Explicit bypass / release-all paths drop both HELD and PARKED directly.
+
+## Key filters for parking
+A HELD window is parked only if all are true:
+- it is being released for timeout or pressure;
+- current qcov is still above `swod_qcov_thr_bp`;
+- current live ratio is low enough: `lbp <= min(20%, swod_lres_thr_bp + 10%)` and `lbp > 0`.
+
+Parking priority favors:
+- colder data,
+- longer runs,
+- higher qcov,
+- fewer valid blocks,
+- older pending discard age.
+
+## Lifetime / bounds
+- Park budget: `max(4, swod_max_held_groups / 2)`.
+- Park hold time: about `4x` original hold, clamped to `[500ms, 2000ms]`.
+- When budget is full, replace only a weaker parked target.
+
+## Files changed
+- `swod.h`
+- `swod.c`
+- `gc.c`
+
+## Important extra fix
+In `gc.c`, the WCE target pass originally consumed `nsearched` once before target filtering and again after a match.
+That makes the target pass run out of budget too early.
+The patch changes it so only real WCE targets consume search budget during target pass.
+
+## Apply
+From repo root:
+
+```bash
+patch -p1 < wce_parked_handoff_apply.patch
+```
+
+
+
+

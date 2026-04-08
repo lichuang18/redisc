@@ -150,6 +150,39 @@ static unsigned int swod_calc_hold_ms(struct f2fs_sb_info *sbi,
 	return hold;
 }
 
+static inline bool swod_group_is_active(const struct swod_group_hint *g)
+{
+	return g->state == SWOD_G_HELD || g->state == SWOD_G_PARKED;
+}
+
+static inline unsigned long swod_group_deadline(const struct swod_group_hint *g)
+{
+	return g->state == SWOD_G_PARKED ? g->park_until : g->hold_until;
+}
+
+static unsigned int swod_calc_park_ms(struct f2fs_sb_info *sbi,
+				      unsigned int run_len,
+				      unsigned int qcov_bp,
+				      unsigned int lres_bp)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	unsigned int park = swod_calc_hold_ms(sbi, run_len, qcov_bp, lres_bp);
+
+	park <<= 2;
+	if (park < dcc->swod_hold_max_ms)
+		park = dcc->swod_hold_max_ms;
+	if (park < SWOD_WCE_PARK_MIN_MS)
+		park = SWOD_WCE_PARK_MIN_MS;
+	if (park > SWOD_WCE_PARK_MAX_MS)
+		park = SWOD_WCE_PARK_MAX_MS;
+	return park;
+}
+
+static inline unsigned int swod_park_budget(struct discard_cmd_control *dcc)
+{
+	return max(4U, dcc->swod_max_held_groups >> 1);
+}
+
 static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 				    unsigned int gid)
 {
@@ -162,29 +195,98 @@ static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 
 	if (g->state == SWOD_G_HELD && sw->nr_held_groups)
 		sw->nr_held_groups--;
+	else if (g->state == SWOD_G_PARKED && sw->nr_parked_groups)
+		sw->nr_parked_groups--;
 
 	g->state = SWOD_G_NORMAL;
 	g->hold_off = 0;
 	g->hold_len = 0;
 	g->hold_qbp = 0;
 	g->hold_lbp = 0;
+	g->park_score = 0;
 	g->hold_until = 0;
+	g->park_until = 0;
 	g->last_eval = jiffies;
 
-	for (i = 0; i < nsegs; i++)
+	for (i = 0; i < nsegs; i++) {
 		clear_bit(first + i, sw->hold_segmap);
+		clear_bit(first + i, sw->park_segmap);
+	}
 }
 
-static void swod_release_group_locked(struct f2fs_sb_info *sbi,
-				      unsigned int gid,
-				      enum swod_release_reason why)
+static bool swod_collect_window_locked(struct f2fs_sb_info *sbi,
+				       unsigned int gid,
+				       unsigned int *qbp,
+				       unsigned int *lbp,
+				       unsigned int *cold_cnt,
+				       unsigned long *oldest)
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct swod_ctrl *sw = dcc->swod;
+	struct swod_group_hint *g = &sw->grp_hint[gid];
+	unsigned int first = swod_group_first_seg(sw, gid);
+	unsigned int i, q = 0, l = 0, cold = 0;
+	unsigned long oldest_j = 0;
+	u64 cap;
 
-	if (!sw)
-		return;
+	if (!swod_group_is_active(g) || !g->hold_len)
+		return false;
 
+	for (i = 0; i < g->hold_len; i++) {
+		unsigned int segno = first + g->hold_off + i;
+		struct seg_entry *se;
+
+		if (segno >= sw->nr_main_segs)
+			return false;
+
+		q += sw->seg_hint[segno].pend_blks;
+		l += get_valid_blocks(sbi, segno, false);
+		if (sw->seg_hint[segno].oldest_jiffies &&
+		    (!oldest_j ||
+		     time_before(sw->seg_hint[segno].oldest_jiffies, oldest_j)))
+			oldest_j = sw->seg_hint[segno].oldest_jiffies;
+
+		se = get_seg_entry(sbi, segno);
+		if (IS_COLD(se->type))
+			cold++;
+	}
+
+	cap = (u64)g->hold_len * sbi->blocks_per_seg;
+	if (!cap)
+		return false;
+
+	if (qbp)
+		*qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
+	if (lbp)
+		*lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
+	if (cold_cnt)
+		*cold_cnt = cold;
+	if (oldest)
+		*oldest = oldest_j;
+	return true;
+}
+
+static unsigned int swod_calc_park_score(unsigned int len,
+					 unsigned int qbp,
+					 unsigned int lbp,
+					 unsigned int cold_cnt,
+					 unsigned long oldest,
+					 unsigned long now)
+{
+	unsigned long age_ms = 0;
+
+	if (oldest && !time_after(oldest, now))
+		age_ms = jiffies_to_msecs(now - oldest);
+	if (age_ms > 1000)
+		age_ms = 1000;
+
+	return cold_cnt * 100000U + len * 10000U + qbp * 2U +
+	       (SWOD_BP_ONE - min(lbp, SWOD_BP_ONE)) + age_ms;
+}
+
+static void swod_account_release(struct swod_ctrl *sw,
+				 enum swod_release_reason why)
+{
 	switch (why) {
 	case SWOD_REL_SUCCESS:
 		atomic64_inc(&sw->success_release_cnt);
@@ -197,8 +299,99 @@ static void swod_release_group_locked(struct f2fs_sb_info *sbi,
 		atomic64_inc(&sw->pressure_release_cnt);
 		break;
 	}
+}
 
+static void swod_drop_group_locked(struct f2fs_sb_info *sbi,
+				   unsigned int gid,
+				   enum swod_release_reason why)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw = dcc->swod;
+
+	if (!sw)
+		return;
+
+	swod_account_release(sw, why);
 	swod_clear_group_locked(sbi, gid);
+}
+
+static bool swod_try_park_group_locked(struct f2fs_sb_info *sbi,
+				       unsigned int gid,
+				       enum swod_release_reason why,
+				       unsigned long now)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw = dcc->swod;
+	struct swod_group_hint *g = &sw->grp_hint[gid];
+	unsigned int qbp, lbp, cold_cnt, limit, budget;
+	unsigned long oldest;
+	unsigned int score, i;
+	unsigned int victim_gid = UINT_MAX;
+	struct swod_group_hint *victim = NULL;
+	unsigned int first;
+
+	if (!sw || g->state != SWOD_G_HELD)
+		return false;
+	if (why != SWOD_REL_TIMEOUT && why != SWOD_REL_PRESSURE)
+		return false;
+	if (!swod_collect_window_locked(sbi, gid, &qbp, &lbp,
+					&cold_cnt, &oldest))
+		return false;
+
+	/* still needs pending holes, but should already be easy to clean */
+	if (qbp < dcc->swod_qcov_thr_bp)
+		return false;
+	limit = min_t(unsigned int, SWOD_WCE_PARK_LRES_CAP_BP,
+		      dcc->swod_lres_thr_bp + 1000);
+	if (!lbp || lbp > limit)
+		return false;
+
+	score = swod_calc_park_score(g->hold_len, qbp, lbp,
+				    cold_cnt, oldest, now);
+	budget = swod_park_budget(dcc);
+	if (sw->nr_parked_groups >= budget) {
+		for (i = 0; i < sw->nr_groups; i++) {
+			struct swod_group_hint *cand = &sw->grp_hint[i];
+
+			if (cand->state != SWOD_G_PARKED)
+				continue;
+			if (!victim || cand->park_score < victim->park_score) {
+				victim_gid = i;
+				victim = cand;
+			}
+		}
+		if (!victim || score <= victim->park_score)
+			return false;
+		swod_drop_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
+	}
+
+	first = swod_group_first_seg(sw, gid);
+	if (sw->nr_held_groups)
+		sw->nr_held_groups--;
+	for (i = 0; i < g->hold_len; i++) {
+		clear_bit(first + g->hold_off + i, sw->hold_segmap);
+		set_bit(first + g->hold_off + i, sw->park_segmap);
+	}
+
+	g->state = SWOD_G_PARKED;
+	g->hold_qbp = qbp;
+	g->hold_lbp = lbp;
+	g->park_score = score;
+	g->hold_until = 0;
+	g->park_until = now + msecs_to_jiffies(
+		swod_calc_park_ms(sbi, g->hold_len, qbp, lbp));
+	g->last_eval = now;
+	sw->nr_parked_groups++;
+	return true;
+}
+
+static void swod_release_group_locked(struct f2fs_sb_info *sbi,
+				      unsigned int gid,
+				      enum swod_release_reason why)
+{
+	if (swod_try_park_group_locked(sbi, gid, why, jiffies))
+		return;
+	swod_drop_group_locked(sbi, gid, why);
 }
 
 static bool swod_window_ready_locked(struct f2fs_sb_info *sbi,
@@ -210,7 +403,7 @@ static bool swod_window_ready_locked(struct f2fs_sb_info *sbi,
 	unsigned int first = swod_group_first_seg(sw, gid);
 	unsigned int i;
 
-	if (g->state != SWOD_G_HELD || !g->hold_len)
+	if (!swod_group_is_active(g) || !g->hold_len)
 		return false;
 
 	for (i = 0; i < g->hold_len; i++) {
@@ -325,7 +518,7 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 	unsigned int best_off = 0, best_len = 0;
 	unsigned int best_qbp = 0, best_lbp = UINT_MAX;
 	unsigned long best_oldest = 0;
-    unsigned int max_len = swod_max_hold_len(sbi, sw, gid);
+	unsigned int max_len = swod_max_hold_len(sbi, sw, gid);
 	unsigned int i, off, len, max_this_len;
 
 	if (!sw || !n)
@@ -333,31 +526,25 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 
 	if (swod_regime_blocked(sbi, dcc, NULL)) {
 		atomic64_inc(&sw->eval_blocked_cnt);
-		if (g->state == SWOD_G_HELD)
-			swod_release_group_locked(sbi, gid, SWOD_REL_PRESSURE);
+		if (swod_group_is_active(g))
+			swod_drop_group_locked(sbi, gid, SWOD_REL_PRESSURE);
 		return;
 	}
 
-	/*
-	 * already held:
-	 * - if urgent mode now requires a smaller window than the current hold,
-	 *   release and re-evaluate below;
-	 * - otherwise only keep / release.
-	 */
-	if (g->state == SWOD_G_HELD) {
-		if (g->hold_len > max_len)
-			swod_release_group_locked(sbi, gid, SWOD_REL_PRESSURE);
-		else {
-			if (swod_window_ready_locked(sbi, gid)) {
-				swod_release_group_locked(sbi, gid, SWOD_REL_SUCCESS);
-				return;
-			}
-			if (time_after_eq(now, g->hold_until)) {
-				swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
-				return;
-			}
+	/* urgent mode can only keep a smaller window; re-evaluate from scratch */
+	if (swod_group_is_active(g) && g->hold_len > max_len)
+		swod_drop_group_locked(sbi, gid, SWOD_REL_PRESSURE);
+
+	if (swod_group_is_active(g)) {
+		if (swod_window_ready_locked(sbi, gid)) {
+			swod_release_group_locked(sbi, gid, SWOD_REL_SUCCESS);
 			return;
 		}
+		if (time_after_eq(now, swod_group_deadline(g))) {
+			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
+			return;
+		}
+		return;
 	}
 
 	for (i = 0; i < n; i++) {
@@ -368,27 +555,27 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 
 	for (off = 0; off < n; off++) {
 		unsigned long cur_oldest = 0;
-        max_this_len = min(max_len, n - off);
-        // 这才是真正的“urgent 下仍然在整个 group 内挑子窗口，但最长只允许 1/2 seg”
+
+		max_this_len = min(max_len, n - off);
 		for (len = 1; len <= max_this_len; len++) {
 			u64 cap, qbp, lbp;
 			unsigned int endi = off + len - 1;
-			unsigned int Q, L;
+			unsigned int q, l;
 
 			if (oldest_seg[endi] &&
 			    (!cur_oldest ||
 			     time_before(oldest_seg[endi], cur_oldest)))
 				cur_oldest = oldest_seg[endi];
 
-			Q = qpref[off + len] - qpref[off];
-			L = lpref[off + len] - lpref[off];
+			q = qpref[off + len] - qpref[off];
+			l = lpref[off + len] - lpref[off];
 			cap = (u64)len * sbi->blocks_per_seg;
 
-			qbp = div_u64((u64)Q * SWOD_BP_ONE, cap);
-			lbp = div_u64((u64)L * SWOD_BP_ONE, cap);
+			qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
+			lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
 
 			/* already fully ready: let stock issue it, do not hold */
-			if (Q == cap)
+			if (q == cap)
 				continue;
 
 			if (qbp < dcc->swod_qcov_thr_bp)
@@ -454,13 +641,17 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 	g->hold_len = best_len;
 	g->hold_qbp = best_qbp;
 	g->hold_lbp = best_lbp;
+	g->park_score = 0;
 	g->hold_until = now + msecs_to_jiffies(
 		swod_calc_hold_ms(sbi, best_len, best_qbp, best_lbp));
+	g->park_until = 0;
 	g->last_eval = now;
 	sw->nr_held_groups++;
 
-	for (i = 0; i < best_len; i++)
+	for (i = 0; i < best_len; i++) {
 		set_bit(first + best_off + i, sw->hold_segmap);
+		clear_bit(first + best_off + i, sw->park_segmap);
+	}
 
 	atomic64_inc(&sw->hold_cnt);
 }
@@ -512,10 +703,13 @@ int f2fs_swod_init(struct f2fs_sb_info *sbi)
 	sw->seg_hint = f2fs_kvzalloc(sbi, seg_hint_sz, GFP_KERNEL);
 	sw->grp_hint = f2fs_kvzalloc(sbi, grp_hint_sz, GFP_KERNEL);
 	sw->hold_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
-	if (!sw->seg_hint || !sw->grp_hint || !sw->hold_segmap) {
+	sw->park_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	if (!sw->seg_hint || !sw->grp_hint || !sw->hold_segmap ||
+	    !sw->park_segmap) {
 		kvfree(sw->seg_hint);
 		kvfree(sw->grp_hint);
 		kvfree(sw->hold_segmap);
+		kvfree(sw->park_segmap);
 		kfree(sw);
 		return -ENOMEM;
 	}
@@ -536,6 +730,7 @@ void f2fs_swod_destroy(struct f2fs_sb_info *sbi)
 	kvfree(sw->seg_hint);
 	kvfree(sw->grp_hint);
 	kvfree(sw->hold_segmap);
+	kvfree(sw->park_segmap);
 	kfree(sw);
 	dcc->swod = NULL;
 }
@@ -576,7 +771,7 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct swod_ctrl *sw = dcc->swod;
 	unsigned int seg0, seg1, gid0, gid1, gid;
-	bool saw_held = false;
+	bool saw_active = false;
 
 	if (!swod_enabled(dcc))
 		return false;
@@ -595,11 +790,11 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 		struct swod_group_hint *g = &sw->grp_hint[gid];
 		unsigned int held_first, held_last;
 
-		if (g->state != SWOD_G_HELD)
+		if (!swod_group_is_active(g))
 			continue;
-		saw_held = true;
+		saw_active = true;
 
-		if (time_after_eq(now, g->hold_until)) {
+		if (time_after_eq(now, swod_group_deadline(g))) {
 			atomic64_inc(&sw->skip_miss_timeout_cnt);
 			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
 			continue;
@@ -615,7 +810,7 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 		held_last  = held_first + g->hold_len - 1;
 
 		/*
-		 * Hold any cmd overlapping a held sub-window.
+		 * Hold any cmd overlapping an active sub-window.
 		 * This covers cross-group cmds and partial overlaps too.
 		 */
 		if (seg1 < held_first || seg0 > held_last) {
@@ -627,7 +822,7 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 		return true;
 	}
 
-	if (!saw_held)
+	if (!saw_active)
 		atomic64_inc(&sw->skip_miss_noheld_cnt);
 	return false;
 }
@@ -643,8 +838,8 @@ static void __f2fs_swod_release_all_locked(struct f2fs_sb_info *sbi,
 		return;
 
 	for (gid = 0; gid < sw->nr_groups; gid++) {
-		if (sw->grp_hint[gid].state == SWOD_G_HELD)
-			swod_release_group_locked(sbi, gid, why);
+		if (swod_group_is_active(&sw->grp_hint[gid]))
+			swod_drop_group_locked(sbi, gid, why);
 	}
 }
 
@@ -675,9 +870,9 @@ void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now)
 	for (gid = 0; gid < sw->nr_groups; gid++) {
 		struct swod_group_hint *g = &sw->grp_hint[gid];
 
-		if (g->state != SWOD_G_HELD)
+		if (!swod_group_is_active(g))
 			continue;
-		if (time_after_eq(now, g->hold_until))
+		if (time_after_eq(now, swod_group_deadline(g)))
 			swod_release_group_locked(sbi, gid, SWOD_REL_TIMEOUT);
 	}
 	mutex_unlock(&dcc->cmd_lock);
@@ -731,6 +926,44 @@ bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
 	end = min(sw->nr_main_segs, segno + nr_segs);
 	for (; segno < end; segno++) {
 		if (test_bit(segno, sw->hold_segmap))
+			return true;
+	}
+
+	return false;
+}
+
+bool f2fs_swod_has_wce_target(struct f2fs_sb_info *sbi)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
+		return false;
+
+	sw = dcc->swod;
+	return !!READ_ONCE(sw->nr_held_groups) || !!READ_ONCE(sw->nr_parked_groups);
+}
+
+bool f2fs_swod_range_wce_target(struct f2fs_sb_info *sbi, unsigned int segno,
+				unsigned int nr_segs)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int end;
+
+	if (!swod_enabled(dcc))
+		return false;
+
+	sw = dcc->swod;
+	if (!nr_segs || segno >= sw->nr_main_segs)
+		return false;
+	if (!READ_ONCE(sw->nr_held_groups) && !READ_ONCE(sw->nr_parked_groups))
+		return false;
+
+	end = min(sw->nr_main_segs, segno + nr_segs);
+	for (; segno < end; segno++) {
+		if (test_bit(segno, sw->hold_segmap) ||
+		    test_bit(segno, sw->park_segmap))
 			return true;
 	}
 
