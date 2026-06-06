@@ -1,0 +1,93 @@
+
+	F2FS-tools: mkfs.f2fs Ver: 1.14.0 (2020-08-24)
+
+Info: Disable heap-based policy
+Info: Debug level = 0
+Info: Trim is enabled
+Info: Segments per section = 1
+Info: Sections per zone = 1
+Info: sector size = 512
+Info: total sectors = 146800640 (71680 MB)
+Info: zone aligned segment0 blkaddr: 512
+Info: format version with
+  "Linux version 5.15.184snapfs (root@kernel) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #2 SMP Tue Mar 3 11:02:10 CST 2026"
+Info: [/dev/nvme2n1p1] Discarding device
+Info: This device doesn't support BLKSECDISCARD
+Info: Discarded 71680 MB
+Info: Overprovision ratio = 0.750%
+Info: Overprovision segments = 539 (GC reserved = 274)
+Info: format successful
+prefill: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=libaio, iodepth=32
+fio-3.28
+Starting 1 process
+prefill: Laying out IO file (1 file / 50174MiB)
+
+prefill: (groupid=0, jobs=1): err= 0: pid=281542: Mon Jun  1 16:55:36 2026
+  write: IOPS=3599, BW=3600MiB/s (3774MB/s)(49.0GiB/13939msec); 0 zone resets
+    slat (usec): min=119, max=744, avg=163.23, stdev=38.44
+    clat (usec): min=5407, max=24143, avg=8704.85, stdev=719.23
+     lat (usec): min=5573, max=24294, avg=8868.36, stdev=719.25
+    clat percentiles (usec):
+     |  1.00th=[ 7832],  5.00th=[ 8160], 10.00th=[ 8455], 20.00th=[ 8586],
+     | 30.00th=[ 8586], 40.00th=[ 8717], 50.00th=[ 8717], 60.00th=[ 8717],
+     | 70.00th=[ 8717], 80.00th=[ 8848], 90.00th=[ 8848], 95.00th=[ 8848],
+     | 99.00th=[ 9241], 99.50th=[10683], 99.90th=[22414], 99.95th=[23462],
+     | 99.99th=[23987]
+   bw (  MiB/s): min= 3482, max= 3824, per=100.00%, avg=3614.92, stdev=57.75, samples=27
+   iops        : min= 3482, max= 3824, avg=3614.89, stdev=57.75, samples=27
+  lat (msec)   : 10=99.40%, 20=0.44%, 50=0.17%
+  cpu          : usr=16.71%, sys=45.26%, ctx=39408, majf=0, minf=13
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=99.9%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,50174,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+  WRITE: bw=3600MiB/s (3774MB/s), 3600MiB/s-3600MiB/s (3774MB/s-3774MB/s), io=49.0GiB (52.6GB), run=13939-13939msec
+
+Disk stats (read/write):
+  nvme2n1: ios=0/91152, merge=0/0, ticks=0/788556, in_queue=788556, util=99.13%
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme2n1p1   70G   51G   20G  73% /mnt
+randupdate: (g=0): rw=randwrite, bs=(R) 4096B-4096B, (W) 4096B-4096B, (T) 4096B-4096B, ioengine=libaio, iodepth=32
+...
+fio-3.28
+Starting 4 processes
+
+randupdate: (groupid=0, jobs=4): err= 0: pid=281963: Mon Jun  1 17:00:39 2026
+  write: IOPS=391k, BW=1526MiB/s (1600MB/s)(447GiB/300001msec); 0 zone resets
+    slat (nsec): min=1655, max=8048.9k, avg=9480.05, stdev=35437.39
+    clat (usec): min=9, max=15938, avg=317.86, stdev=205.86
+     lat (usec): min=11, max=16000, avg=327.41, stdev=209.40
+    clat percentiles (usec):
+     |  1.00th=[  184],  5.00th=[  192], 10.00th=[  210], 20.00th=[  281],
+     | 30.00th=[  306], 40.00th=[  310], 50.00th=[  310], 60.00th=[  314],
+     | 70.00th=[  318], 80.00th=[  326], 90.00th=[  351], 95.00th=[  379],
+     | 99.00th=[  627], 99.50th=[ 1418], 99.90th=[ 3589], 99.95th=[ 4424],
+     | 99.99th=[ 6390]
+   bw (  MiB/s): min=  841, max= 1740, per=100.00%, avg=1526.75, stdev=28.66, samples=2396
+   iops        : min=215376, max=445503, avg=390848.64, stdev=7338.05, samples=2396
+  lat (usec)   : 10=0.01%, 20=0.01%, 50=0.01%, 100=0.01%, 250=15.87%
+  lat (usec)   : 500=82.26%, 750=1.01%, 1000=0.17%
+  lat (msec)   : 2=0.37%, 4=0.25%, 10=0.07%, 20=0.01%
+  fsync/fdatasync/sync_file_range:
+    sync (nsec): min=31, max=3359, avg=69.64, stdev=53.44
+    sync percentiles (nsec):
+     |  1.00th=[   42],  5.00th=[   50], 10.00th=[   51], 20.00th=[   54],
+     | 30.00th=[   56], 40.00th=[   57], 50.00th=[   59], 60.00th=[   62],
+     | 70.00th=[   66], 80.00th=[   74], 90.00th=[   89], 95.00th=[  109],
+     | 99.00th=[  233], 99.50th=[  422], 99.90th=[  588], 99.95th=[  716],
+     | 99.99th=[ 2064]
+  cpu          : usr=7.01%, sys=89.40%, ctx=20957187, majf=0, minf=122
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=100.1%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.1%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,117159958,0,117158 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=32
+
+Run status group 0 (all jobs):
+  WRITE: bw=1526MiB/s (1600MB/s), 1526MiB/s-1526MiB/s (1600MB/s-1600MB/s), io=447GiB (480GB), run=300001-300001msec
+
+Disk stats (read/write):
+  nvme2n1: ios=0/117174310, merge=0/0, ticks=0/989850, in_queue=989850, util=100.00%

@@ -1,0 +1,17 @@
+queue_discard count:
+10
+issue_discard count:
+2
+remove_discard count:
+3
+
+First f2fs_queue_discard lines:
+ f2fs_ckpt-259:8-281371 [135] 596281.175250: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3a7800, blklen = 0x6200
+ f2fs_ckpt-259:8-281371 [135] 596281.175687: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3adc00, blklen = 0x9a00
+ f2fs_ckpt-259:8-281371 [135] 596281.175689: f2fs_queue_discard:   dev = (259,8), blkstart = 0x18400, blklen = 0x1
+ f2fs_ckpt-259:8-281371 [135] 596281.175692: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3a7749, blklen = 0xb7
+ f2fs_ckpt-259:8-281371 [135] 596281.175695: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3b7600, blklen = 0x112
+
+First f2fs_issue_discard lines:
+ f2fs_discard-25-281373 [137] 596301.649137: f2fs_issue_discard:   dev = (259,8), blkstart = 0x3a7749, blklen = 0xffcb
+ f2fs_discard-25-281373 [137] 596363.091457: f2fs_issue_discard:   dev = (259,8), blkstart = 0x3a7600, blklen = 0x200

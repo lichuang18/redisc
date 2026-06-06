@@ -1,0 +1,158 @@
+CPU 0 is empty
+CPU 1 is empty
+CPU 2 is empty
+CPU 3 is empty
+CPU 4 is empty
+CPU 5 is empty
+CPU 6 is empty
+CPU 7 is empty
+CPU 8 is empty
+CPU 9 is empty
+CPU 10 is empty
+CPU 11 is empty
+CPU 12 is empty
+CPU 13 is empty
+CPU 14 is empty
+CPU 15 is empty
+CPU 16 is empty
+CPU 17 is empty
+CPU 18 is empty
+CPU 19 is empty
+CPU 20 is empty
+CPU 21 is empty
+CPU 22 is empty
+CPU 23 is empty
+CPU 24 is empty
+CPU 25 is empty
+CPU 26 is empty
+CPU 27 is empty
+CPU 28 is empty
+CPU 29 is empty
+CPU 30 is empty
+CPU 31 is empty
+CPU 32 is empty
+CPU 33 is empty
+CPU 34 is empty
+CPU 35 is empty
+CPU 36 is empty
+CPU 37 is empty
+CPU 38 is empty
+CPU 39 is empty
+CPU 40 is empty
+CPU 41 is empty
+CPU 42 is empty
+CPU 43 is empty
+CPU 44 is empty
+CPU 45 is empty
+CPU 46 is empty
+CPU 47 is empty
+CPU 48 is empty
+CPU 49 is empty
+CPU 50 is empty
+CPU 51 is empty
+CPU 52 is empty
+CPU 53 is empty
+CPU 54 is empty
+CPU 55 is empty
+CPU 56 is empty
+CPU 57 is empty
+CPU 58 is empty
+CPU 59 is empty
+CPU 60 is empty
+CPU 61 is empty
+CPU 62 is empty
+CPU 63 is empty
+CPU 64 is empty
+CPU 65 is empty
+CPU 66 is empty
+CPU 67 is empty
+CPU 68 is empty
+CPU 69 is empty
+CPU 70 is empty
+CPU 71 is empty
+CPU 72 is empty
+CPU 73 is empty
+CPU 74 is empty
+CPU 75 is empty
+CPU 76 is empty
+CPU 77 is empty
+CPU 78 is empty
+CPU 79 is empty
+CPU 80 is empty
+CPU 81 is empty
+CPU 82 is empty
+CPU 83 is empty
+CPU 84 is empty
+CPU 85 is empty
+CPU 86 is empty
+CPU 87 is empty
+CPU 88 is empty
+CPU 89 is empty
+CPU 90 is empty
+CPU 91 is empty
+CPU 92 is empty
+CPU 93 is empty
+CPU 94 is empty
+CPU 95 is empty
+CPU 96 is empty
+CPU 97 is empty
+CPU 98 is empty
+CPU 99 is empty
+CPU 100 is empty
+CPU 101 is empty
+CPU 102 is empty
+CPU 103 is empty
+CPU 104 is empty
+CPU 105 is empty
+CPU 106 is empty
+CPU 107 is empty
+CPU 108 is empty
+CPU 109 is empty
+CPU 110 is empty
+CPU 111 is empty
+CPU 112 is empty
+CPU 113 is empty
+CPU 114 is empty
+CPU 115 is empty
+CPU 116 is empty
+CPU 117 is empty
+CPU 118 is empty
+CPU 119 is empty
+CPU 120 is empty
+CPU 121 is empty
+CPU 122 is empty
+CPU 123 is empty
+CPU 124 is empty
+CPU 125 is empty
+CPU 126 is empty
+CPU 127 is empty
+CPU 128 is empty
+CPU 129 is empty
+CPU 130 is empty
+CPU 131 is empty
+CPU 132 is empty
+CPU 133 is empty
+CPU 134 is empty
+CPU 136 is empty
+CPU 138 is empty
+CPU 139 is empty
+CPU 140 is empty
+CPU 141 is empty
+CPU 142 is empty
+CPU 143 is empty
+cpus=144
+ f2fs_ckpt-259:8-281371 [135] 596281.175250: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3a7800, blklen = 0x6200
+ f2fs_ckpt-259:8-281371 [135] 596281.175687: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3adc00, blklen = 0x9a00
+ f2fs_ckpt-259:8-281371 [135] 596281.175689: f2fs_queue_discard:   dev = (259,8), blkstart = 0x18400, blklen = 0x1
+ f2fs_ckpt-259:8-281371 [135] 596281.175692: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3a7749, blklen = 0xb7
+ f2fs_ckpt-259:8-281371 [135] 596281.175695: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3b7600, blklen = 0x112
+ f2fs_ckpt-259:8-281371 [135] 596281.175699: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3ada00, blklen = 0x13f
+ f2fs_ckpt-259:8-281371 [135] 596281.175702: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3adb40, blklen = 0xc0
+ f2fs_ckpt-259:8-281371 [135] 596281.177624: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3b7712, blklen = 0x2
+ f2fs_ckpt-259:8-281371 [135] 596301.649034: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3ada00, blklen = 0x200
+ f2fs_ckpt-259:8-281371 [135] 596301.649036: f2fs_remove_discard:  dev = (259,8), blkstart = 0x3a7749, blklen = 0x63f7
+ f2fs_discard-25-281373 [137] 596301.649137: f2fs_issue_discard:   dev = (259,8), blkstart = 0x3a7749, blklen = 0xffcb
+ f2fs_discard-25-281373 [137] 596301.649590: f2fs_remove_discard:  dev = (259,8), blkstart = 0x3a7749, blklen = 0xffcb
+ f2fs_ckpt-259:8-281371 [135] 596363.091358: f2fs_queue_discard:   dev = (259,8), blkstart = 0x3a7600, blklen = 0x200
+ f2fs_discard-25-281373 [137] 596363.091457: f2fs_issue_discard:   dev = (259,8), blkstart = 0x3a7600, blklen = 0x200
+ f2fs_discard-25-281373 [137] 596363.091905: f2fs_remove_discard:  dev = (259,8), blkstart = 0x3a7600, blklen = 0x200

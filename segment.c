@@ -1000,6 +1000,14 @@ static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
 	struct list_head *pend_list;
 	struct discard_cmd *dc;
 
+	// lch
+	int plist;
+	unsigned int segno, off;
+	unsigned int end_segno, end_off;
+	block_t last_lstart;
+	u64 ts_ns;
+
+
 	f2fs_bug_on(sbi, !len);
 
 	pend_list = &dcc->pend_list[plist_idx(len)];
@@ -1024,6 +1032,31 @@ static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
 	dc->orig_len = 0;
 	atomic_inc(&dcc->discard_cmd_cnt);
 	dcc->undiscard_blks += len;
+	/* lch: discard cmd creation log */
+	plist = plist_idx(len);
+	ts_ns = ktime_get_ns();
+	last_lstart = lstart + len - 1;
+
+	segno = GET_SEGNO(sbi, lstart);
+	off = GET_BLKOFF_FROM_SEG0(sbi, lstart);
+
+	end_segno = GET_SEGNO(sbi, last_lstart);
+	end_off = GET_BLKOFF_FROM_SEG0(sbi, last_lstart);
+
+	pr_info("[redisc_dc_create] ts_ns=%llu lstart=%llu start=%llu len=%llu "
+		"segno=%u off=%u end_segno=%u end_off=%u plist=%d "
+		"undiscard=%llu cmd_cnt=%d\n",
+		(unsigned long long)ts_ns,
+		(unsigned long long)lstart,
+		(unsigned long long)start,
+		(unsigned long long)len,
+		segno,
+		off,
+		end_segno,
+		end_off,
+		plist,
+		(unsigned long long)dcc->undiscard_blks,
+		atomic_read(&dcc->discard_cmd_cnt));
 
 	return dc;
 }
@@ -1106,11 +1139,24 @@ static void f2fs_submit_discard_endio(struct bio *bio)
 						 dc->policy_type == DPOLICY_FSTRIM ? "FSTRIM" : "UMOUNT";
 			struct discard_cmd_control *dcc = dc->dcc;
 
-			printk(KERN_INFO "f2fs_discard: policy=%s, start=%u, len=%u, latency=%llu us, merge(b:%llu f:%llu bf:%llu)\n",
-			       policy_str, dc->start, dc->orig_len, latency_ns / 1000,
-			       dcc->discard_back_merge_cnt,
-			       dcc->discard_front_merge_cnt,
-			       dcc->discard_both_merge_cnt);
+			printk(KERN_INFO "[redisc_dc_done] ts_ns=%llu policy=%s "
+			       "lstart=%llu start=%llu cur_len=%llu orig_len=%llu "
+			       "latency_us=%llu error=%d "
+			       "merge_back=%llu merge_front=%llu merge_both=%llu "
+			       "undiscard=%llu cmd_cnt=%d\n",
+			       (unsigned long long)ktime_get_ns(),
+			       policy_str,
+			       (unsigned long long)dc->lstart,
+			       (unsigned long long)dc->start,
+			       (unsigned long long)dc->len,
+			       (unsigned long long)dc->orig_len,
+			       (unsigned long long)(latency_ns / 1000),
+			       dc->error,
+			       (unsigned long long)dcc->discard_back_merge_cnt,
+			       (unsigned long long)dcc->discard_front_merge_cnt,
+			       (unsigned long long)dcc->discard_both_merge_cnt,
+			       (unsigned long long)dcc->undiscard_blks,
+			       atomic_read(&dcc->discard_cmd_cnt));
 		}
 		complete_all(&dc->wait);
 	}

@@ -14,7 +14,7 @@ fio --name=fill \
     --numjobs=1 \
     --fallocate=none \
     --iodepth=32 \
-    --write_lat_log=./data/discard_default/tmp \
+    --write_lat_log=./tmp \
     --randrepeat=1 \
     --randseed=12345 \
     --runtime=300 \
@@ -31,4 +31,3 @@ fio --name=fill \
     # --rw=randwrite \
     # --rw=randread \
 echo "$(date '+%F %T')"
-
