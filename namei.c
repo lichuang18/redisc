@@ -1222,7 +1222,6 @@ static int f2fs_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 	f2fs_unlock_op(sbi);
 
 	if (IS_DIRSYNC(old_dir) || IS_DIRSYNC(new_dir)){
-		pr_info("[ef2fs]: cross name\n");
 		f2fs_sync_fs(sbi->sb, 1);
 	}
 

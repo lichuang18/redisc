@@ -994,42 +994,112 @@ static unsigned int get_free_segment(struct f2fs_sb_info *sbi)
 	return NULL_SEGNO;
 }
 
+// static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
+// 		struct block_device *bdev, block_t lstart,
+// 		block_t start, block_t len)
+// {
+// 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+// 	struct list_head *pend_list;
+// 	struct discard_cmd *dc;
+
+// 	f2fs_bug_on(sbi, !len);
+
+// 	pend_list = &dcc->pend_list[plist_idx(len)];
+
+// 	dc = f2fs_kmem_cache_alloc(discard_cmd_slab, GFP_NOFS, true, NULL);
+// 	INIT_LIST_HEAD(&dc->list);
+// 	dc->bdev = bdev;
+// 	dc->dcc = dcc;
+// 	dc->lstart = lstart;
+// 	dc->start = start;
+// 	dc->len = len;
+// 	dc->ref = 0;
+// 	dc->state = D_PREP;
+// 	dc->queued = 0;
+// 	dc->error = 0;
+// 	init_completion(&dc->wait);
+// 	list_add_tail(&dc->list, pend_list);
+// 	spin_lock_init(&dc->lock);
+// 	dc->bio_ref = 0;
+// 	dc->submit_time = 0;
+// 	dc->policy_type = -1;
+// 	dc->orig_len = 0;
+// 	dc->enq_jiffies = jiffies;   /* SWOD */
+// 	atomic_inc(&dcc->discard_cmd_cnt);
+// 	dcc->undiscard_blks += len;
+
+// 	return dc;
+// }
+
 static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
-		struct block_device *bdev, block_t lstart,
-		block_t start, block_t len)
+        struct block_device *bdev, block_t lstart,
+        block_t start, block_t len)
 {
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	struct list_head *pend_list;
-	struct discard_cmd *dc;
+    struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+    struct list_head *pend_list;
+    struct discard_cmd *dc;
 
-	f2fs_bug_on(sbi, !len);
+    // lch
+    int plist;
+    unsigned int segno, off;
+    unsigned int end_segno, end_off;
+    block_t last_lstart;
+    u64 ts_ns;
 
-	pend_list = &dcc->pend_list[plist_idx(len)];
+    f2fs_bug_on(sbi, !len);
 
-	dc = f2fs_kmem_cache_alloc(discard_cmd_slab, GFP_NOFS, true, NULL);
-	INIT_LIST_HEAD(&dc->list);
-	dc->bdev = bdev;
-	dc->dcc = dcc;
-	dc->lstart = lstart;
-	dc->start = start;
-	dc->len = len;
-	dc->ref = 0;
-	dc->state = D_PREP;
-	dc->queued = 0;
-	dc->error = 0;
-	init_completion(&dc->wait);
-	list_add_tail(&dc->list, pend_list);
-	spin_lock_init(&dc->lock);
-	dc->bio_ref = 0;
-	dc->submit_time = 0;
-	dc->policy_type = -1;
-	dc->orig_len = 0;
+    pend_list = &dcc->pend_list[plist_idx(len)];
+
+    dc = f2fs_kmem_cache_alloc(discard_cmd_slab, GFP_NOFS, true, NULL);
+    INIT_LIST_HEAD(&dc->list);
+    dc->bdev = bdev;
+    dc->dcc = dcc;
+    dc->lstart = lstart;
+    dc->start = start;
+    dc->len = len;
+    dc->ref = 0;
+    dc->state = D_PREP;
+    dc->queued = 0;
+    dc->error = 0;
+    init_completion(&dc->wait);
+    list_add_tail(&dc->list, pend_list);
+    spin_lock_init(&dc->lock);
+    dc->bio_ref = 0;
+    dc->submit_time = 0;
+    dc->policy_type = -1;
+    dc->orig_len = 0;
 	dc->enq_jiffies = jiffies;   /* SWOD */
-	atomic_inc(&dcc->discard_cmd_cnt);
-	dcc->undiscard_blks += len;
+    atomic_inc(&dcc->discard_cmd_cnt);
+    dcc->undiscard_blks += len;
+    /* lch: discard cmd creation log */
+    plist = plist_idx(len);
+    ts_ns = ktime_get_ns();
+    last_lstart = lstart + len - 1;
 
-	return dc;
+    segno = GET_SEGNO(sbi, lstart);
+    off = GET_BLKOFF_FROM_SEG0(sbi, lstart);
+
+    end_segno = GET_SEGNO(sbi, last_lstart);
+    end_off = GET_BLKOFF_FROM_SEG0(sbi, last_lstart);
+
+    pr_info("[redisc_dc_create] ts_ns=%llu lstart=%llu start=%llu len=%llu "
+        "segno=%u off=%u end_segno=%u end_off=%u plist=%d "
+        "undiscard=%llu cmd_cnt=%d\n",
+        (unsigned long long)ts_ns,
+        (unsigned long long)lstart,
+        (unsigned long long)start,
+        (unsigned long long)len,
+        segno,
+        off,
+        end_segno,
+        end_off,
+        plist,
+        (unsigned long long)dcc->undiscard_blks,
+        atomic_read(&dcc->discard_cmd_cnt));
+
+    return dc;
 }
+
 
 static struct discard_cmd *__attach_discard_cmd(struct f2fs_sb_info *sbi,
 				struct block_device *bdev, block_t lstart,
@@ -1103,35 +1173,79 @@ static void __remove_discard_cmd(struct f2fs_sb_info *sbi,
 		f2fs_swod_refresh_around_locked(sbi, old_lstart, old_len);
 }
 
+// static void f2fs_submit_discard_endio(struct bio *bio)
+// {
+// 	struct discard_cmd *dc = (struct discard_cmd *)bio->bi_private;
+// 	unsigned long flags;
+
+// 	spin_lock_irqsave(&dc->lock, flags);
+// 	if (!dc->error)
+// 		dc->error = blk_status_to_errno(bio->bi_status);
+// 	dc->bio_ref--;
+// 	if (!dc->bio_ref && dc->state == D_SUBMIT) {
+// 		dc->state = D_DONE;
+// 		if (dc->submit_time > 0) {
+// 			u64 latency_ns = ktime_get_ns() - dc->submit_time;
+// 			const char *policy_str = dc->policy_type == DPOLICY_BG ? "BG" :
+// 						 dc->policy_type == DPOLICY_FORCE ? "FORCE" :
+// 						 dc->policy_type == DPOLICY_FSTRIM ? "FSTRIM" : "UMOUNT";
+// 			struct discard_cmd_control *dcc = dc->dcc;
+
+// 			printk(KERN_INFO "f2fs_discard: policy=%s, start=%u, len=%u, latency=%llu us, merge(b:%llu f:%llu bf:%llu)\n",
+// 			       policy_str, dc->start, dc->orig_len, latency_ns / 1000,
+// 			       dcc->discard_back_only_merge_cnt,
+// 			       dcc->discard_front_only_merge_cnt,
+// 			       dcc->discard_both_merge_cnt);
+// 		}
+// 		complete_all(&dc->wait);
+// 	}
+// 	spin_unlock_irqrestore(&dc->lock, flags);
+// 	bio_put(bio);
+// }
+
 static void f2fs_submit_discard_endio(struct bio *bio)
 {
-	struct discard_cmd *dc = (struct discard_cmd *)bio->bi_private;
-	unsigned long flags;
+    struct discard_cmd *dc = (struct discard_cmd *)bio->bi_private;
+    unsigned long flags;
 
-	spin_lock_irqsave(&dc->lock, flags);
-	if (!dc->error)
-		dc->error = blk_status_to_errno(bio->bi_status);
-	dc->bio_ref--;
-	if (!dc->bio_ref && dc->state == D_SUBMIT) {
-		dc->state = D_DONE;
-		if (dc->submit_time > 0) {
-			u64 latency_ns = ktime_get_ns() - dc->submit_time;
-			const char *policy_str = dc->policy_type == DPOLICY_BG ? "BG" :
-						 dc->policy_type == DPOLICY_FORCE ? "FORCE" :
-						 dc->policy_type == DPOLICY_FSTRIM ? "FSTRIM" : "UMOUNT";
-			struct discard_cmd_control *dcc = dc->dcc;
+    spin_lock_irqsave(&dc->lock, flags);
+    if (!dc->error)
+        dc->error = blk_status_to_errno(bio->bi_status);
+    dc->bio_ref--;
+    if (!dc->bio_ref && dc->state == D_SUBMIT) {
+        dc->state = D_DONE;
+        if (dc->submit_time > 0) {
+            u64 latency_ns = ktime_get_ns() - dc->submit_time;
+            const char *policy_str = dc->policy_type == DPOLICY_BG ? "BG" :
+                         dc->policy_type == DPOLICY_FORCE ? "FORCE" :
+                         dc->policy_type == DPOLICY_FSTRIM ? "FSTRIM" : "UMOUNT";
+            struct discard_cmd_control *dcc = dc->dcc;
 
-			printk(KERN_INFO "f2fs_discard: policy=%s, start=%u, len=%u, latency=%llu us, merge(b:%llu f:%llu bf:%llu)\n",
-			       policy_str, dc->start, dc->orig_len, latency_ns / 1000,
-			       dcc->discard_back_only_merge_cnt,
-			       dcc->discard_front_only_merge_cnt,
-			       dcc->discard_both_merge_cnt);
-		}
-		complete_all(&dc->wait);
-	}
-	spin_unlock_irqrestore(&dc->lock, flags);
-	bio_put(bio);
+            printk(KERN_INFO "[redisc_dc_done] ts_ns=%llu policy=%s "
+                   "lstart=%llu start=%llu cur_len=%llu orig_len=%llu "
+                   "latency_us=%llu error=%d "
+                   "merge_back=%llu merge_front=%llu merge_both=%llu "
+                   "undiscard=%llu cmd_cnt=%d\n",
+                   (unsigned long long)ktime_get_ns(),
+                   policy_str,
+                   (unsigned long long)dc->lstart,
+                   (unsigned long long)dc->start,
+                   (unsigned long long)dc->len,
+                   (unsigned long long)dc->orig_len,
+                   (unsigned long long)(latency_ns / 1000),
+                   dc->error,
+                   (unsigned long long)dcc->discard_back_only_merge_cnt,
+                   (unsigned long long)dcc->discard_front_only_merge_cnt,
+                   (unsigned long long)dcc->discard_both_merge_cnt,
+                   (unsigned long long)dcc->undiscard_blks,
+                   atomic_read(&dcc->discard_cmd_cnt));
+        }
+        complete_all(&dc->wait);
+    }
+    spin_unlock_irqrestore(&dc->lock, flags);
+    bio_put(bio);
 }
+
 
 static void __check_sit_bitmap(struct f2fs_sb_info *sbi,
 				block_t start, block_t end)
@@ -1310,7 +1424,6 @@ submit:
 		bio->bi_private = dc;
 		bio->bi_end_io = f2fs_submit_discard_endio;
 		bio->bi_opf |= flag;
-		// pr_info("discard submit_bio.....\n");
 		submit_bio(bio);
 
 		atomic_inc(&dcc->issued_discard);
@@ -2327,8 +2440,8 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 
 	dcc->swod_frag_ipu_enable = 0;
 	dcc->swod_frag_ipu_max_pend_blks = 32; // 只盯着very small fragment
-	dcc->swod_frag_ipu_min_cmds = 2; // 至少是碎的
-	dcc->swod_frag_ipu_age_ms = 5000;// 先只碰更老的
+	dcc->swod_frag_ipu_min_cmds = 12; // 严格：只对极度碎片化的 segment 启用
+	dcc->swod_frag_ipu_age_ms = 15000; // 严格：只碰非常老的数据
 	dcc->swod_frag_ipu_skip_hot = 1;// 热数据默认不碰
 	dcc->swod = NULL;
 

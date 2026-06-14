@@ -1027,13 +1027,28 @@ bool f2fs_swod_should_frag_ipu(struct inode *inode,
 	}
 
 	/*
-	 * advisory bias only; lockless snapshot of seg_hint is sufficient.
+	 * 基于 segment 碎片化程度的判断（SFI 改进 v2）
+	 * 不能有 discard_granularity 特权
+	 * 必须 segment 上有足够多的 pending discard 才允许 IPU
+	 * 设置为 discard_granularity 的 4 倍，防止 len=1 的 dc 凑够 nr_cmds 就满足条件
 	 */
 	pend_blks = READ_ONCE(sw->seg_hint[segno].pend_blks);
 	nr_cmds = READ_ONCE(sw->seg_hint[segno].nr_cmds);
-	if (!pend_blks ||
-	    pend_blks > dcc->swod_frag_ipu_max_pend_blks ||
-	    nr_cmds < dcc->swod_frag_ipu_min_cmds) {
+
+	/*
+	 * 条件1：该 segment 必须有足够的碎片化
+	 * pend_blks >= discard_granularity * 4，防止 len=1 的 dc 满足条件
+	 */
+	if (!pend_blks || pend_blks < dcc->discard_granularity * 4) {
+		atomic64_inc(&sw->frag_ipu_skip_shape_cnt);
+		return false;
+	}
+
+	/*
+	 * 条件2：碎片必须来自多个 cmd 的合并
+	 * 否则说明该 segment 的碎片不是真正的 fragment
+	 */
+	if (nr_cmds < dcc->swod_frag_ipu_min_cmds) {
 		atomic64_inc(&sw->frag_ipu_skip_shape_cnt);
 		return false;
 	}
