@@ -407,6 +407,139 @@ static ssize_t swod_eval_no_candidate_cnt_show(struct f2fs_attr *a,
 		(unsigned long long)atomic64_read(&dcc->swod->eval_no_candidate_cnt));
 }
 
+// formation-aware counters
+static ssize_t swod_nr_wce_groups_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%d\n",
+		atomic_read(&dcc->swod->nr_wce_groups));
+}
+
+static ssize_t swod_wce_eligible_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->wce_eligible_cnt));
+}
+
+static ssize_t swod_short_hold_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->short_hold_cnt));
+}
+
+static ssize_t swod_completion_hold_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->completion_hold_cnt));
+}
+
+static ssize_t swod_capture_followup_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->capture_followup_cnt));
+}
+
+static ssize_t swod_capture_blocks_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->capture_blocks));
+}
+
+static ssize_t swod_policy_bypass_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->policy_bypass_cnt));
+}
+
+static ssize_t swod_overlap_bypass_cnt_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->overlap_bypass_cnt));
+}
+
+static ssize_t swod_coverage_gain_blocks_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->coverage_gain_blocks));
+}
+
+static ssize_t swod_start_nr_cmds_sum_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->start_nr_cmds_sum));
+}
+
+static ssize_t swod_release_nr_cmds_sum_show(struct f2fs_attr *a,
+			struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%llu\n",
+		(unsigned long long)atomic64_read(&dcc->swod->release_nr_cmds_sum));
+}
+
 // swod over
 #define SWOD_COUNTER_SHOW(_name, _field)				 \
 static ssize_t _name##_show(struct f2fs_attr *a,			 \
@@ -767,6 +900,81 @@ out:
 	}
 	// wce over
 
+	// formation-aware swod
+	if (!strcmp(a->attr.name, "swod_formation_enable")) {
+		if (t > 1)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_short_hold_min_ms")) {
+		if (t > UINT_MAX)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_short_hold_max_ms")) {
+		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+		if (t > UINT_MAX)
+			return -EINVAL;
+		if (dcc && t < dcc->swod_short_hold_min_ms)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_min_cmds")) {
+		if (t > 64)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_max_avg_piece_blks")) {
+		if (t > 256)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_frag_min_pend_blks")) {
+		if (t > 1024)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_growth_min_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_wce_qcov_thr_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_wce_lres_thr_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	if (!strcmp(a->attr.name, "swod_overlap_skip_ratio_bp")) {
+		if (t > 10000)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
 
 	if (!strcmp(a->attr.name, "migration_granularity")) {
 		if (t == 0 || t > sbi->segs_per_sec)
@@ -1043,6 +1251,28 @@ F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
 		swod_gc_fg_enable, swod_gc_fg_enable);
 
+// formation-aware swod
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_formation_enable, swod_formation_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_short_hold_min_ms, swod_short_hold_min_ms);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_short_hold_max_ms, swod_short_hold_max_ms);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_min_cmds, swod_frag_min_cmds);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_max_avg_piece_blks, swod_frag_max_avg_piece_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_min_pend_blks, swod_frag_min_pend_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_growth_min_bp, swod_growth_min_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_wce_qcov_thr_bp, swod_wce_qcov_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_wce_lres_thr_bp, swod_wce_lres_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_overlap_skip_ratio_bp, swod_overlap_skip_ratio_bp);
+
 F2FS_RW_ATTR(RESERVED_BLOCKS, f2fs_sb_info, reserved_blocks, reserved_blocks);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, batched_trim_sections, trim_sections);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, ipu_policy, ipu_policy);
@@ -1116,6 +1346,19 @@ F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_shape_cnt);
 F2FS_GENERAL_RO_ATTR(swod_gc_pick_bg_cnt);
 F2FS_GENERAL_RO_ATTR(swod_gc_pick_fg_cnt);
 F2FS_GENERAL_RO_ATTR(swod_gc_fallback_cnt);
+
+// formation-aware
+F2FS_GENERAL_RO_ATTR(swod_nr_wce_groups);
+F2FS_GENERAL_RO_ATTR(swod_wce_eligible_cnt);
+F2FS_GENERAL_RO_ATTR(swod_short_hold_cnt);
+F2FS_GENERAL_RO_ATTR(swod_completion_hold_cnt);
+F2FS_GENERAL_RO_ATTR(swod_capture_followup_cnt);
+F2FS_GENERAL_RO_ATTR(swod_capture_blocks);
+F2FS_GENERAL_RO_ATTR(swod_policy_bypass_cnt);
+F2FS_GENERAL_RO_ATTR(swod_overlap_bypass_cnt);
+F2FS_GENERAL_RO_ATTR(swod_coverage_gain_blocks);
+F2FS_GENERAL_RO_ATTR(swod_start_nr_cmds_sum);
+F2FS_GENERAL_RO_ATTR(swod_release_nr_cmds_sum);
 
 
 #ifdef CONFIG_F2FS_STAT_FS
@@ -1294,6 +1537,29 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_gc_pick_bg_cnt),
 	ATTR_LIST(swod_gc_pick_fg_cnt),
 	ATTR_LIST(swod_gc_fallback_cnt),
+
+	// formation-aware swod
+	ATTR_LIST(swod_formation_enable),
+	ATTR_LIST(swod_short_hold_min_ms),
+	ATTR_LIST(swod_short_hold_max_ms),
+	ATTR_LIST(swod_frag_min_cmds),
+	ATTR_LIST(swod_frag_max_avg_piece_blks),
+	ATTR_LIST(swod_frag_min_pend_blks),
+	ATTR_LIST(swod_growth_min_bp),
+	ATTR_LIST(swod_wce_qcov_thr_bp),
+	ATTR_LIST(swod_wce_lres_thr_bp),
+	ATTR_LIST(swod_overlap_skip_ratio_bp),
+	ATTR_LIST(swod_nr_wce_groups),
+	ATTR_LIST(swod_wce_eligible_cnt),
+	ATTR_LIST(swod_short_hold_cnt),
+	ATTR_LIST(swod_completion_hold_cnt),
+	ATTR_LIST(swod_capture_followup_cnt),
+	ATTR_LIST(swod_capture_blocks),
+	ATTR_LIST(swod_policy_bypass_cnt),
+	ATTR_LIST(swod_overlap_bypass_cnt),
+	ATTR_LIST(swod_coverage_gain_blocks),
+	ATTR_LIST(swod_start_nr_cmds_sum),
+	ATTR_LIST(swod_release_nr_cmds_sum),
 
 	NULL,
 };

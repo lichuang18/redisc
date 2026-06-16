@@ -360,6 +360,8 @@ struct discard_cmd {
 	
 	/* SWOD: age source */
 	unsigned long enq_jiffies;
+	/* SWOD: skip flag for held window cmds */
+	unsigned char swod_skip;
 };
 
 enum {
@@ -420,6 +422,18 @@ struct discard_cmd_control {
 	unsigned int swod_cmd_pressure;        /* pending cmd threshold */
 	unsigned int swod_blk_pressure;        /* undiscard_blks threshold */
 	unsigned int swod_max_held_groups;     /* bound waiting scope */
+
+	/* ---------- formation-aware SWOD tunables ---------- */
+	unsigned int swod_formation_enable;          /* 0/1 */
+	unsigned int swod_short_hold_min_ms;
+	unsigned int swod_short_hold_max_ms;
+	unsigned int swod_frag_min_cmds;            /* at least one group of small fragments */
+	unsigned int swod_frag_max_avg_piece_blks;  /* avg fragment still small */
+	unsigned int swod_frag_min_pend_blks;        /* avoid tiny windows */
+	unsigned int swod_growth_min_bp;             /* growth threshold for follow-up detection */
+	unsigned int swod_wce_qcov_thr_bp;          /* maturity threshold for WCE */
+	unsigned int swod_wce_lres_thr_bp;          /* live residual cap for WCE */
+	unsigned int swod_overlap_skip_ratio_bp;    /* overlap threshold for skip */
 
 	struct swod_ctrl *swod;
 

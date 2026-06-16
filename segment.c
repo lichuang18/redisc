@@ -1068,7 +1068,9 @@ static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
     dc->submit_time = 0;
     dc->policy_type = -1;
     dc->orig_len = 0;
-	dc->enq_jiffies = jiffies;   /* SWOD */
+    dc->enq_jiffies = jiffies;   /* SWOD: age tracking */
+    dc->swod_skip = 0;
+
     atomic_inc(&dcc->discard_cmd_cnt);
     dcc->undiscard_blks += len;
     /* lch: discard cmd creation log */
@@ -1139,11 +1141,6 @@ static void __remove_discard_cmd(struct f2fs_sb_info *sbi,
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	unsigned long flags;
 
-	// 保留旧状态和旧范围
-	u8 old_state = dc->state;
-	block_t old_lstart = dc->lstart;
-	block_t old_len = dc->len;
-
 	trace_f2fs_remove_discard(dc->bdev, dc->start, dc->len);
 
 	spin_lock_irqsave(&dc->lock, flags);
@@ -1164,13 +1161,11 @@ static void __remove_discard_cmd(struct f2fs_sb_info *sbi,
 			KERN_INFO, sbi->sb->s_id,
 			dc->lstart, dc->start, dc->len, dc->error);
 	__detach_discard_cmd(dcc, dc);
-	
+
 	/*
-	 * 只有删掉的是 D_PREP 命令时，这次删除才改变了 SWOD
-	 * 所看到的 pending opportunity。
+	 * V4.5: 移除 remove 路径的 refresh，避免 O(n) 遍历 rb-tree
+	 * held 信息已在 eval→install 时设置到 hold_segmap bitmap
 	 */
-	if (old_state == D_PREP && old_len)
-		f2fs_swod_refresh_around_locked(sbi, old_lstart, old_len);
 }
 
 // static void f2fs_submit_discard_endio(struct bio *bio)
@@ -1441,13 +1436,19 @@ submit:
 		__update_discard_tree_range(sbi, bdev, lstart, start, len, false);
 	}
 	/*
-	* SWOD 关心的是“旧 D_PREP 机会最终变成了什么”：
-	* 可能是整条都离开 D_PREP，也可能是一部分离开、一部分 leftover 重新入队。
-	* 所以要在 submit 收尾后，对旧范围统一 refresh 一次。
-	*/
-	if (orig_len && dc->state != D_PREP)
-		f2fs_swod_refresh_around_locked(sbi, orig_lstart, orig_len);
-
+	 * V4.5: submit 时增量更新 seg_hint
+	 */
+	if (dcc->swod_enable && dcc->swod && orig_len) {
+		struct swod_ctrl *sw = dcc->swod;
+		unsigned int segno = GET_SEGNO(sbi, orig_lstart);
+		if (segno < sw->nr_main_segs) {
+			struct swod_seg_hint *h = &sw->seg_hint[segno];
+			if (h->pend_blks >= orig_len)
+				h->pend_blks -= orig_len;
+			if (h->nr_cmds)
+				h->nr_cmds--;
+		}
+	}
 	return err;
 }
 
@@ -1487,7 +1488,6 @@ static void __punch_discard_cmd(struct f2fs_sb_info *sbi,
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct discard_info di = dc->di;
 	bool modified = false;
-	u8 old_state = dc->state;          /* SWOD */
 
 	if (dc->state == D_DONE || dc->len == 1) {
 		__remove_discard_cmd(sbi, dc);
@@ -1518,11 +1518,9 @@ static void __punch_discard_cmd(struct f2fs_sb_info *sbi,
 		}
 	}
 	/*
-	 * punch 改写了旧 D_PREP 可见范围，统一按旧范围 refresh 一次。
-	 * 这里只在 old_state == D_PREP 时做，避免对非 pending 态做无效刷新。
+	 * V4.5: 移除 punch 路径的 refresh，避免 O(n) 遍历 rb-tree
+	 * held 信息已在 eval→install 时设置到 hold_segmap bitmap
 	 */
-	if (old_state == D_PREP && di.len)
-		f2fs_swod_refresh_around_locked(sbi, di.lstart, di.len);
 }
 
 
@@ -1536,9 +1534,6 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 				block_t start, block_t len, bool swod_refresh)
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	/* SWOD: 记录这次 tree update 原始影响范围 */
-	block_t orig_lstart = lstart;
-	block_t orig_len = len;
 
 	struct discard_cmd *prev_dc = NULL, *next_dc = NULL;
 	struct discard_cmd *dc;
@@ -1636,9 +1631,12 @@ static void __update_discard_tree_range(struct f2fs_sb_info *sbi,
 		next_dc = rb_entry_safe(node, struct discard_cmd, rb_node);
 	}
 
-	/* ---- SWOD hook: 只放在统一出口 ---- */
-	if (swod_refresh && orig_len)
-		f2fs_swod_refresh_around_locked(sbi, orig_lstart, orig_len);
+	/*
+	 * SWOD: 移除 merge 路径的 refresh，避免 O(n) 遍历 rb-tree
+	 * held 信息已在 eval→install 时设置到 hold_segmap bitmap
+	 * formation 检测由后台定时任务补偿
+	 */
+	(void)swod_refresh;
 }
 
 static int __queue_discard_cmd(struct f2fs_sb_info *sbi,
@@ -1700,16 +1698,12 @@ static unsigned int __issue_discard_cmd_orderly(struct f2fs_sb_info *sbi,
 			goto next;
 
 		/*
-		 * SWOD: 当前 cmd 落在 HELD window 内，且尚未到 release 条件，
-		 * 则先跳过，不提交。
-		 *
-		 * 这里必须推进 next_pos，避免下一轮 orderly scan
-		 * 又从同一个 held cmd 开始，造成空转。
+		 * V4.5: 测试 - 注释掉 should_skip 调用
 		 */
-		if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies)) {
-			dcc->next_pos = dc->lstart + dc->len;
-			goto next;
-		}
+		// if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies)) {
+		// 	dcc->next_pos = dc->lstart + dc->len;
+		// 	goto next;
+		// }
 
 		if (dpolicy->io_aware && !is_idle(sbi, DISCARD_TIME)) {
 			io_interrupted = true;
@@ -1790,14 +1784,10 @@ retry:
 				f2fs_time_over(sbi, UMOUNT_DISCARD_TIMEOUT))
 				break;
 			/*
-			 * SWOD: 若该 cmd 落在 HELD window 内且尚未到 release 条件，
-			 * 则本轮先跳过，不提交。
-			 *
-			 * list_for_each_entry_safe() 会自然继续扫描下一个节点，
-			 * 这里直接 continue 即可。
+			 * V4.5: 测试 - 注释掉 should_skip 调用
 			 */
-			if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies))
-				continue;
+			// if (f2fs_swod_should_skip_locked(sbi, dc, dpolicy, jiffies))
+			// 	continue;
 
 			if (dpolicy->io_aware && i < dpolicy->io_aware_gran &&
 						!is_idle(sbi, DISCARD_TIME)) {
@@ -2437,6 +2427,18 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 	dcc->swod_completion_enable = 0;
 	dcc->swod_gc_bg_enable = 1;
 	dcc->swod_gc_fg_enable = 1;
+
+	/* formation-aware swod knobs */
+	dcc->swod_formation_enable = 0;
+	dcc->swod_short_hold_min_ms = 50;   /* at least 1 issue cycle (50ms) */
+	dcc->swod_short_hold_max_ms = 300;  /* ~6 issue cycles, avoids timeout-before-scan */
+	dcc->swod_frag_min_cmds = 8;
+	dcc->swod_frag_max_avg_piece_blks = 16;
+	dcc->swod_frag_min_pend_blks = 24;
+	dcc->swod_growth_min_bp = 500;
+	dcc->swod_wce_qcov_thr_bp = 8000;
+	dcc->swod_wce_lres_thr_bp = 2000;
+	dcc->swod_overlap_skip_ratio_bp = 6000;   /* require 60% overlap to skip */
 
 	dcc->swod_frag_ipu_enable = 0;
 	dcc->swod_frag_ipu_max_pend_blks = 32; // 只盯着very small fragment

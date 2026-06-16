@@ -377,7 +377,12 @@ static inline bool swod_wce_match(struct f2fs_sb_info *sbi,
 				  unsigned int segno,
 				  unsigned int nr_segs)
 {
-	return f2fs_swod_range_wce_target(sbi, segno, nr_segs);
+	/* First check if segment belongs to a held/parked window */
+	if (!f2fs_swod_range_wce_target(sbi, segno, nr_segs))
+		return false;
+
+	/* Then check if this specific segment is WCE-eligible */
+	return f2fs_swod_seg_wce_eligible(sbi, segno);
 }
 
 static inline void swod_wce_account_pick(struct f2fs_sb_info *sbi, int gc_type)

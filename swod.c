@@ -1,7 +1,8 @@
 /* fs/f2fs/swod.c */
-#include "swod.h"                                              
-#include "segment.h" 
-#include "node.h" 
+#include "swod.h"
+#include "segment.h"
+#include "node.h"
+#include <linux/random.h>
 static inline bool swod_enabled(struct discard_cmd_control *dcc)
 {
 	return dcc && dcc->swod_enable && dcc->swod;
@@ -192,13 +193,22 @@ static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 	unsigned int first = swod_group_first_seg(sw, gid);
 	unsigned int nsegs = swod_group_nsegs(sw, gid);
 	unsigned int i;
+	u16 start_cmds = 0, last_cmds = 0;
 
 	if (g->state == SWOD_G_HELD && sw->nr_held_groups)
 		sw->nr_held_groups--;
 	else if (g->state == SWOD_G_PARKED && sw->nr_parked_groups)
 		sw->nr_parked_groups--;
 
+	if (g->wce_eligible && atomic_read(&sw->nr_wce_groups) > 0) {
+		atomic_dec(&sw->nr_wce_groups);
+		start_cmds = g->start_nr_cmds;
+		last_cmds = g->last_nr_cmds;
+	}
+
 	g->state = SWOD_G_NORMAL;
+	g->action = SWOD_ACT_BYPASS;
+	g->wce_eligible = 0;
 	g->hold_off = 0;
 	g->hold_len = 0;
 	g->hold_qbp = 0;
@@ -207,10 +217,27 @@ static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 	g->hold_until = 0;
 	g->park_until = 0;
 	g->last_eval = jiffies;
+	g->start_qbp = 0;
+	g->start_lbp = 0;
+	g->start_nr_cmds = 0;
+	g->start_avg_piece = 0;
+	g->last_qbp = 0;
+	g->last_lbp = 0;
+	g->last_nr_cmds = 0;
+	g->last_avg_piece = 0;
+	g->last_q_growth = 0;
+	g->last_cmd_growth = 0;
 
 	for (i = 0; i < nsegs; i++) {
 		clear_bit(first + i, sw->hold_segmap);
 		clear_bit(first + i, sw->park_segmap);
+		clear_bit(first + i, sw->wce_segmap);
+	}
+
+	/* formation stats */
+	if (start_cmds) {
+		atomic64_add(start_cmds, &sw->start_nr_cmds_sum);
+		atomic64_add(last_cmds, &sw->release_nr_cmds_sum);
 	}
 }
 
@@ -295,10 +322,167 @@ static void swod_account_release(struct swod_ctrl *sw,
 		atomic64_inc(&sw->timeout_release_cnt);
 		break;
 	case SWOD_REL_PRESSURE:
-	default:
 		atomic64_inc(&sw->pressure_release_cnt);
 		break;
+	case SWOD_REL_CAPTURE:
+		atomic64_inc(&sw->capture_release_cnt);
+		break;
+	case SWOD_REL_MATURE:
+		atomic64_inc(&sw->mature_release_cnt);
+		break;
+	case SWOD_REL_BYPASS:
+		atomic64_inc(&sw->bypass_release_cnt);
+		break;
 	}
+}
+
+/* Formation-aware helpers */
+static void swod_build_window_feat(struct f2fs_sb_info *sbi,
+	unsigned int first, unsigned int off, unsigned int len,
+	u16 *out_qbp, u16 *out_lbp, u16 *out_ncmds, u16 *out_avg_piece,
+	u32 *out_pend_blks)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw = dcc->swod;
+	u32 q = 0, l = 0, ncmds = 0, pend_blks = 0;
+	unsigned int i;
+
+	for (i = 0; i < len; i++) {
+		unsigned int segno = first + off + i;
+		struct swod_seg_hint *h = &sw->seg_hint[segno];
+		q += h->pend_blks;
+		l += get_valid_blocks(sbi, segno, false);
+		ncmds += h->nr_cmds;
+		pend_blks += h->pend_blks;
+	}
+
+	if (out_pend_blks)
+		*out_pend_blks = pend_blks;
+
+	if (out_qbp) {
+		u64 cap = (u64)len * sbi->blocks_per_seg;
+		*out_qbp = cap ? div_u64((u64)q * SWOD_BP_ONE, cap) : 0;
+	}
+	if (out_lbp) {
+		u64 cap = (u64)len * sbi->blocks_per_seg;
+		*out_lbp = cap ? div_u64((u64)l * SWOD_BP_ONE, cap) : 0;
+	}
+	if (out_ncmds)
+		*out_ncmds = (u16)min_t(u32, ncmds, 0xFFFF);
+	if (out_avg_piece)
+		*out_avg_piece = ncmds ? min_t(u16, 0xFFFF,
+			div_u64((u64)pend_blks * SWOD_BP_ONE, ncmds)) : 0;
+}
+
+static unsigned int swod_calc_short_hold_ms(struct f2fs_sb_info *sbi)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	unsigned int hold = dcc->swod_short_hold_min_ms;
+	unsigned int range = dcc->swod_short_hold_max_ms - dcc->swod_short_hold_min_ms;
+
+	/* randomize within [min, max] to avoid thundering herd */
+	if (range)
+		hold += get_random_u32() % range;
+	return hold;
+}
+
+/*
+ * Returns formation score based on:
+ * - avg_piece: smaller = more fragmented = better
+ * - growth: positive = still growing = better for capture
+ * - cmd_growth: positive = follow-up activity = better for capture
+ */
+static s32 swod_score_formation(struct f2fs_sb_info *sbi,
+	u16 avg_piece, s16 q_growth, s16 cmd_growth)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	s32 score = 0;
+
+	/* Small fragments are good for capture */
+	if (avg_piece && avg_piece <= dcc->swod_frag_max_avg_piece_blks)
+		score += 1000;
+
+	/* Growth indicates ongoing formation */
+	if (q_growth > 0)
+		score += q_growth / 10;
+
+	/* Follow-up activity is a strong signal */
+	if (cmd_growth > 0)
+		score += cmd_growth * 100;
+
+	return score;
+}
+
+/*
+ * Install a candidate window with formation-aware decision.
+ * Returns true if a new window was installed.
+ */
+static bool swod_install_candidate(struct f2fs_sb_info *sbi,
+	unsigned int gid, unsigned int off, unsigned int len,
+	u16 qbp, u16 lbp, u16 nr_cmds, u16 avg_piece,
+	enum swod_action action, unsigned long now)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw = dcc->swod;
+	struct swod_group_hint *g = &sw->grp_hint[gid];
+	unsigned int first = swod_group_first_seg(sw, gid);
+	unsigned int i;
+
+	g->state = SWOD_G_HELD;
+	g->action = action;
+	g->hold_off = off;
+	g->hold_len = len;
+	g->hold_qbp = qbp;
+	g->hold_lbp = lbp;
+	g->park_score = 0;
+	g->hold_until = now + msecs_to_jiffies(
+		action == SWOD_ACT_SHORT_HOLD ?
+			swod_calc_short_hold_ms(sbi) :
+			swod_calc_hold_ms(sbi, len, qbp, lbp));
+	g->park_until = 0;
+	g->last_eval = now;
+
+	/* snapshot for formation tracking */
+	g->start_qbp = qbp;
+	g->start_lbp = lbp;
+	g->start_nr_cmds = nr_cmds;
+	g->start_avg_piece = avg_piece;
+	g->last_qbp = qbp;
+	g->last_lbp = lbp;
+	g->last_nr_cmds = nr_cmds;
+	g->last_avg_piece = avg_piece;
+	g->last_q_growth = 0;
+	g->last_cmd_growth = 0;
+
+	/* wce_eligible: only COMPLETION_HOLD with high maturity */
+	g->wce_eligible = (action == SWOD_ACT_COMPLETION_HOLD &&
+		qbp >= dcc->swod_wce_qcov_thr_bp &&
+		lbp <= dcc->swod_wce_lres_thr_bp) ? 1 : 0;
+
+	if (g->wce_eligible) {
+		atomic_inc(&sw->nr_wce_groups);
+		atomic64_inc(&sw->wce_eligible_cnt);
+	}
+
+	/* action stats */
+	if (action == SWOD_ACT_SHORT_HOLD)
+		atomic64_inc(&sw->short_hold_cnt);
+	else if (action == SWOD_ACT_COMPLETION_HOLD)
+		atomic64_inc(&sw->completion_hold_cnt);
+
+	sw->nr_held_groups++;
+
+	for (i = 0; i < len; i++) {
+		set_bit(first + off + i, sw->hold_segmap);
+		clear_bit(first + off + i, sw->park_segmap);
+		if (g->wce_eligible)
+			set_bit(first + off + i, sw->wce_segmap);
+		else
+			clear_bit(first + off + i, sw->wce_segmap);
+	}
+
+	atomic64_inc(&sw->hold_cnt);
+	return true;
 }
 
 static void swod_drop_group_locked(struct f2fs_sb_info *sbi,
@@ -368,8 +552,11 @@ static bool swod_try_park_group_locked(struct f2fs_sb_info *sbi,
 	first = swod_group_first_seg(sw, gid);
 	if (sw->nr_held_groups)
 		sw->nr_held_groups--;
+	if (g->wce_eligible && atomic_read(&sw->nr_wce_groups) > 0)
+		atomic_dec(&sw->nr_wce_groups);
 	for (i = 0; i < g->hold_len; i++) {
 		clear_bit(first + g->hold_off + i, sw->hold_segmap);
+		clear_bit(first + g->hold_off + i, sw->wce_segmap);
 		set_bit(first + g->hold_off + i, sw->park_segmap);
 	}
 
@@ -381,6 +568,7 @@ static bool swod_try_park_group_locked(struct f2fs_sb_info *sbi,
 	g->park_until = now + msecs_to_jiffies(
 		swod_calc_park_ms(sbi, g->hold_len, qbp, lbp));
 	g->last_eval = now;
+	g->wce_eligible = 0;
 	sw->nr_parked_groups++;
 	return true;
 }
@@ -514,12 +702,26 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 	unsigned int qpref[SWOD_MAX_WIN_SEGS + 1] = {0};
 	unsigned int lpref[SWOD_MAX_WIN_SEGS + 1] = {0};
 	unsigned long oldest_seg[SWOD_MAX_WIN_SEGS] = {0};
-	bool found = false;
+	bool found_short = false, found_complete = false;
+	unsigned int best_short_off = 0, best_short_len = 0;
+	unsigned int best_short_qbp = 0, best_short_lbp = UINT_MAX;
+	unsigned int best_short_ncmds = 0, best_short_avg_piece = 0;
+	unsigned int best_short_pend_blks = 0;
+	unsigned long best_short_oldest = 0;
+	s32 best_short_score = 0;
+	unsigned int best_complete_off = 0, best_complete_len = 0;
+	unsigned int best_complete_qbp = 0, best_complete_lbp = UINT_MAX;
+	unsigned int best_complete_ncmds = 0, best_complete_avg_piece = 0;
+	unsigned int best_complete_pend_blks = 0;
+	unsigned long best_complete_oldest = 0;
+	/* consolidated best for pressure eviction and install */
 	unsigned int best_off = 0, best_len = 0;
 	unsigned int best_qbp = 0, best_lbp = UINT_MAX;
-	unsigned long best_oldest = 0;
 	unsigned int max_len = swod_max_hold_len(sbi, sw, gid);
 	unsigned int i, off, len, max_this_len;
+	u16 cand_ncmds, cand_avg_piece;
+	u32 cand_pend_blks;
+	enum swod_action action;
 
 	if (!sw || !n)
 		return;
@@ -571,34 +773,109 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 			l = lpref[off + len] - lpref[off];
 			cap = (u64)len * sbi->blocks_per_seg;
 
-			qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
-			lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
-
 			/* already fully ready: let stock issue it, do not hold */
 			if (q == cap)
 				continue;
 
-			if (qbp < dcc->swod_qcov_thr_bp)
-				continue;
+			/* lres safety gate: very high live residual blocks short-term
+			 * formation hold, but gates WCE completion path later */
 			if (lbp > dcc->swod_lres_thr_bp)
 				continue;
 
-			if (!found ||
-			    len > best_len ||
-			    (len == best_len && lbp < best_lbp) ||
-			    (len == best_len && lbp == best_lbp &&
-			     (!best_oldest || time_before(cur_oldest, best_oldest)))) {
-				found = true;
-				best_off = off;
-				best_len = len;
-				best_qbp = qbp;
-				best_lbp = lbp;
-				best_oldest = cur_oldest;
+			/* Build formation features to evaluate SHORT_HOLD potential */
+			swod_build_window_feat(sbi, first, off, len,
+				NULL, NULL, &cand_ncmds, &cand_avg_piece,
+				&cand_pend_blks);
+
+			/* Formation-based entry: SHORT_HOLD needs small fragments
+			 * and minimum pend_blks, not high qcov */
+			if (cand_ncmds >= dcc->swod_frag_min_cmds &&
+			    cand_avg_piece <= dcc->swod_frag_max_avg_piece_blks &&
+			    cand_pend_blks >= dcc->swod_frag_min_pend_blks) {
+				s16 fq_growth = 0, fcmd_growth = 0;
+				s32 fscore = 0;
+
+				if (g->state == SWOD_G_HELD && g->hold_len > 0) {
+					fq_growth = (s16)qbp - (s16)g->last_qbp;
+					fcmd_growth = (s16)cand_ncmds -
+						     (s16)g->last_nr_cmds;
+				}
+				fscore = swod_score_formation(sbi, cand_avg_piece,
+					fq_growth, fcmd_growth);
+
+				/* SHORT_HOLD: positive formation signal */
+				if (fscore >= 100) {
+					/* prefer shorter windows with good formation
+					 * (smaller len = faster to fill) */
+					if (!found_short ||
+					    fscore > best_short_score ||
+					    (fscore == best_short_score &&
+					     len < best_short_len) ||
+					    (fscore == best_short_score &&
+					     len == best_short_len &&
+					     lbp < best_short_lbp)) {
+						found_short = true;
+						best_short_score = fscore;
+						best_short_off = off;
+						best_short_len = len;
+						best_short_qbp = qbp;
+						best_short_lbp = lbp;
+						best_short_ncmds = cand_ncmds;
+						best_short_avg_piece = cand_avg_piece;
+						best_short_pend_blks = cand_pend_blks;
+						best_short_oldest = cur_oldest;
+					}
+				}
+			}
+
+			/* COMPLETION_HOLD: needs high qcov for maturity */
+			if (qbp >= dcc->swod_wce_qcov_thr_bp &&
+			    lbp <= dcc->swod_wce_lres_thr_bp) {
+				if (!found_complete ||
+				    len > best_complete_len ||
+				    (len == best_complete_len &&
+				     lbp < best_complete_lbp) ||
+				    (len == best_complete_len &&
+				     lbp == best_complete_lbp &&
+				     (!best_complete_oldest ||
+				      time_before(cur_oldest,
+						  best_complete_oldest)))) {
+					found_complete = true;
+					best_complete_off = off;
+					best_complete_len = len;
+					best_complete_qbp = qbp;
+					best_complete_lbp = lbp;
+					best_complete_ncmds = cand_ncmds;
+					best_complete_avg_piece = cand_avg_piece;
+					best_complete_pend_blks = cand_pend_blks;
+					best_complete_oldest = cur_oldest;
+				}
 			}
 		}
 	}
 
-	if (!found) {
+	/* Priority: SHORT_HOLD > COMPLETION_HOLD */
+	if (found_short) {
+		action = SWOD_ACT_SHORT_HOLD;
+		best_off = best_short_off;
+		best_len = best_short_len;
+		best_qbp = best_short_qbp;
+		best_lbp = best_short_lbp;
+		cand_ncmds = best_short_ncmds;
+		cand_avg_piece = best_short_avg_piece;
+		cand_pend_blks = best_short_pend_blks;
+		atomic64_inc(&sw->capture_followup_cnt);
+		atomic64_add(cand_pend_blks, &sw->capture_blocks);
+	} else if (found_complete) {
+		action = SWOD_ACT_COMPLETION_HOLD;
+		best_off = best_complete_off;
+		best_len = best_complete_len;
+		best_qbp = best_complete_qbp;
+		best_lbp = best_complete_lbp;
+		cand_ncmds = best_complete_ncmds;
+		cand_avg_piece = best_complete_avg_piece;
+		cand_pend_blks = best_complete_pend_blks;
+	} else {
 		atomic64_inc(&sw->eval_no_candidate_cnt);
 		return;
 	}
@@ -636,24 +913,16 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 		swod_release_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
 	}
 
-	g->state = SWOD_G_HELD;
-	g->hold_off = best_off;
-	g->hold_len = best_len;
-	g->hold_qbp = best_qbp;
-	g->hold_lbp = best_lbp;
-	g->park_score = 0;
-	g->hold_until = now + msecs_to_jiffies(
-		swod_calc_hold_ms(sbi, best_len, best_qbp, best_lbp));
-	g->park_until = 0;
-	g->last_eval = now;
-	sw->nr_held_groups++;
-
-	for (i = 0; i < best_len; i++) {
-		set_bit(first + best_off + i, sw->hold_segmap);
-		clear_bit(first + best_off + i, sw->park_segmap);
+	/* update formation growth stats */
+	if (g->state == SWOD_G_HELD && g->hold_len > 0) {
+		s32 gain = ((s32)best_qbp - (s32)g->last_qbp);
+		if (gain > 0)
+			atomic64_add(gain, &sw->coverage_gain_blocks);
 	}
 
-	atomic64_inc(&sw->hold_cnt);
+	swod_install_candidate(sbi, gid, best_off, best_len,
+		best_qbp, best_lbp, cand_ncmds, cand_avg_piece,
+		action, now);
 }
 
 int f2fs_swod_init(struct f2fs_sb_info *sbi)
@@ -700,19 +969,57 @@ int f2fs_swod_init(struct f2fs_sb_info *sbi)
 	grp_hint_sz = array_size(sw->nr_groups, sizeof(*sw->grp_hint));
 	bm_sz = BITS_TO_LONGS(sw->nr_main_segs) * sizeof(unsigned long);
 
-	sw->seg_hint = f2fs_kvzalloc(sbi, seg_hint_sz, GFP_KERNEL);
-	sw->grp_hint = f2fs_kvzalloc(sbi, grp_hint_sz, GFP_KERNEL);
-	sw->hold_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
-	sw->park_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	pr_info("SWOD: nr_main_segs=%u nr_groups=%u seg_hint_sz=%lu grp_hint_sz=%lu bm_sz=%lu total=%lu\n",
+		sw->nr_main_segs, sw->nr_groups, seg_hint_sz, grp_hint_sz, bm_sz,
+		seg_hint_sz + grp_hint_sz + 3 * bm_sz);
+
+	sw->seg_hint = f2fs_kmalloc(sbi, seg_hint_sz, GFP_KERNEL);
+	if (!sw->seg_hint)
+		sw->seg_hint = f2fs_kvzalloc(sbi, seg_hint_sz, GFP_KERNEL);
+	sw->grp_hint = f2fs_kmalloc(sbi, grp_hint_sz, GFP_KERNEL);
+	if (!sw->grp_hint)
+		sw->grp_hint = f2fs_kvzalloc(sbi, grp_hint_sz, GFP_KERNEL);
+	sw->hold_segmap = f2fs_kmalloc(sbi, bm_sz, GFP_KERNEL);
+	if (!sw->hold_segmap)
+		sw->hold_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	sw->park_segmap = f2fs_kmalloc(sbi, bm_sz, GFP_KERNEL);
+	if (!sw->park_segmap)
+		sw->park_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	sw->wce_segmap = f2fs_kmalloc(sbi, bm_sz, GFP_KERNEL);
+	if (!sw->wce_segmap)
+		sw->wce_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
 	if (!sw->seg_hint || !sw->grp_hint || !sw->hold_segmap ||
-	    !sw->park_segmap) {
+	    !sw->park_segmap || !sw->wce_segmap) {
 		kvfree(sw->seg_hint);
 		kvfree(sw->grp_hint);
 		kvfree(sw->hold_segmap);
 		kvfree(sw->park_segmap);
+		kvfree(sw->wce_segmap);
 		kfree(sw);
 		return -ENOMEM;
 	}
+
+	/* init formation-aware tunables with defaults */
+	if (!dcc->swod_formation_enable)
+		dcc->swod_formation_enable = 1;
+	if (!dcc->swod_short_hold_min_ms)
+		dcc->swod_short_hold_min_ms = 1;
+	if (!dcc->swod_short_hold_max_ms)
+		dcc->swod_short_hold_max_ms = 10;
+	if (!dcc->swod_frag_min_cmds)
+		dcc->swod_frag_min_cmds = 8;
+	if (!dcc->swod_frag_max_avg_piece_blks)
+		dcc->swod_frag_max_avg_piece_blks = 16;
+	if (!dcc->swod_frag_min_pend_blks)
+		dcc->swod_frag_min_pend_blks = 32;
+	if (!dcc->swod_growth_min_bp)
+		dcc->swod_growth_min_bp = 100;
+	if (!dcc->swod_wce_qcov_thr_bp)
+		dcc->swod_wce_qcov_thr_bp = 7000;
+	if (!dcc->swod_wce_lres_thr_bp)
+		dcc->swod_wce_lres_thr_bp = 2000;
+	if (!dcc->swod_overlap_skip_ratio_bp)
+		dcc->swod_overlap_skip_ratio_bp = 5000;
 
 	dcc->swod = sw;
 	return 0;
@@ -731,6 +1038,7 @@ void f2fs_swod_destroy(struct f2fs_sb_info *sbi)
 	kvfree(sw->grp_hint);
 	kvfree(sw->hold_segmap);
 	kvfree(sw->park_segmap);
+	kvfree(sw->wce_segmap);
 	kfree(sw);
 	dcc->swod = NULL;
 }
@@ -770,16 +1078,47 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct swod_ctrl *sw = dcc->swod;
-	unsigned int seg0, seg1, gid0, gid1, gid;
+	unsigned int seg0, seg1, gid0, gid1;
+	unsigned int held_first, held_last;
+	unsigned int overlap_start, overlap_end, overlap_segs;
+	unsigned int cmd_segs, overlap_ratio_bp;
 	bool saw_active = false;
+	unsigned int gid;
 
 	if (!swod_enabled(dcc))
+		return false;
+
+	/* Fast path: no held groups, skip expensive check */
+	if (!READ_ONCE(sw->nr_held_groups) && !dc->swod_skip)
 		return false;
 
 	atomic64_inc(&sw->skip_check_cnt);
 
 	if (dc->state != D_PREP)
 		return false;
+
+	/* Fast path: cmd was marked at create time as landing in held window */
+	if (dc->swod_skip) {
+		seg0 = GET_SEGNO(sbi, dc->di.lstart);
+		seg1 = GET_SEGNO(sbi, dc->di.lstart + dc->di.len - 1);
+		gid0 = swod_gid(sw, seg0);
+		gid1 = swod_gid(sw, seg1);
+
+		/* Check if any held window still active for this cmd's range */
+		for (gid = gid0; gid <= gid1; gid++) {
+			struct swod_group_hint *g = &sw->grp_hint[gid];
+
+			if (swod_group_is_active(g) &&
+			    !time_after_eq(now, swod_group_deadline(g))) {
+				dc->swod_skip = 0;
+				atomic64_inc(&sw->skip_cnt);
+				return true;
+			}
+		}
+		/* Held window expired, clear flag and issue normally */
+		dc->swod_skip = 0;
+		atomic64_inc(&sw->skip_miss_timeout_cnt);
+	}
 
 	seg0 = GET_SEGNO(sbi, dc->di.lstart);
 	seg1 = GET_SEGNO(sbi, dc->di.lstart + dc->di.len - 1);
@@ -788,7 +1127,6 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 
 	for (gid = gid0; gid <= gid1; gid++) {
 		struct swod_group_hint *g = &sw->grp_hint[gid];
-		unsigned int held_first, held_last;
 
 		if (!swod_group_is_active(g))
 			continue;
@@ -810,11 +1148,32 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 		held_last  = held_first + g->hold_len - 1;
 
 		/*
-		 * Hold any cmd overlapping an active sub-window.
-		 * This covers cross-group cmds and partial overlaps too.
+		 * Skip only cmds with significant overlap with held window.
+		 * Partial cmds with small overlap ratio should still be issued.
 		 */
 		if (seg1 < held_first || seg0 > held_last) {
 			atomic64_inc(&sw->skip_miss_overlap_cnt);
+			continue;
+		}
+
+		/* calculate overlap ratio */
+		overlap_start = max(seg0, held_first);
+		overlap_end = min(seg1, held_last);
+		overlap_segs = overlap_end - overlap_start + 1;
+		cmd_segs = seg1 - seg0 + 1;
+		overlap_ratio_bp =
+			div_u64((u64)overlap_segs * SWOD_BP_ONE, cmd_segs);
+
+		/* SHORT_HOLD: require higher overlap ratio to skip */
+		if (g->action == SWOD_ACT_SHORT_HOLD &&
+		    overlap_ratio_bp < dcc->swod_overlap_skip_ratio_bp) {
+			atomic64_inc(&sw->overlap_bypass_cnt);
+			continue;
+		}
+
+		/* BYPASS action: should not reach here, but just in case */
+		if (g->action == SWOD_ACT_BYPASS) {
+			atomic64_inc(&sw->policy_bypass_cnt);
 			continue;
 		}
 
@@ -866,6 +1225,11 @@ void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now)
 		return;
 
 	sw = dcc->swod;
+
+	/* Fast path: no held groups, skip expensive group iteration */
+	if (!READ_ONCE(sw->nr_held_groups))
+		return;
+
 	mutex_lock(&dcc->cmd_lock);
 	for (gid = 0; gid < sw->nr_groups; gid++) {
 		struct swod_group_hint *g = &sw->grp_hint[gid];
@@ -941,7 +1305,9 @@ bool f2fs_swod_has_wce_target(struct f2fs_sb_info *sbi)
 		return false;
 
 	sw = dcc->swod;
-	return !!READ_ONCE(sw->nr_held_groups) || !!READ_ONCE(sw->nr_parked_groups);
+	return !!READ_ONCE(sw->nr_held_groups) ||
+	       !!READ_ONCE(sw->nr_parked_groups) ||
+	       !!atomic_read(&sw->nr_wce_groups);
 }
 
 bool f2fs_swod_range_wce_target(struct f2fs_sb_info *sbi, unsigned int segno,
@@ -957,17 +1323,41 @@ bool f2fs_swod_range_wce_target(struct f2fs_sb_info *sbi, unsigned int segno,
 	sw = dcc->swod;
 	if (!nr_segs || segno >= sw->nr_main_segs)
 		return false;
-	if (!READ_ONCE(sw->nr_held_groups) && !READ_ONCE(sw->nr_parked_groups))
+	if (!READ_ONCE(sw->nr_held_groups) &&
+	    !READ_ONCE(sw->nr_parked_groups) &&
+	    !atomic_read(&sw->nr_wce_groups))
 		return false;
 
 	end = min(sw->nr_main_segs, segno + nr_segs);
 	for (; segno < end; segno++) {
 		if (test_bit(segno, sw->hold_segmap) ||
-		    test_bit(segno, sw->park_segmap))
+		    test_bit(segno, sw->park_segmap) ||
+		    test_bit(segno, sw->wce_segmap))
 			return true;
 	}
 
 	return false;
+}
+
+/*
+ * Check if a segment belongs to a WCE-eligible window (short-hold with
+ * high formation score).
+ */
+bool f2fs_swod_seg_wce_eligible(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
+		return false;
+
+	sw = dcc->swod;
+	if (!atomic_read(&sw->nr_wce_groups))
+		return false;
+	if (segno >= sw->nr_main_segs)
+		return false;
+
+	return test_bit(segno, sw->wce_segmap);
 }
 
 bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
@@ -1075,4 +1465,28 @@ bool f2fs_swod_should_frag_ipu(struct inode *inode,
 
 	atomic64_inc(&sw->frag_ipu_pick_cnt);
 	return true;
+}
+
+/*
+ * Called at create time: check if the new discard cmd lands inside a held window.
+ * Returns true if the cmd should be marked as SWOD skip.
+ * Caller holds cmd_lock.
+ */
+bool f2fs_swod_mark_held_cmd(struct f2fs_sb_info *sbi, block_t lstart, block_t len)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
+		return false;
+
+	sw = dcc->swod;
+
+	/* fast path: no held windows */
+	if (!READ_ONCE(sw->nr_held_groups))
+		return false;
+
+	/* check segment range of this cmd against held segmap */
+	return f2fs_swod_range_held(sbi, GET_SEGNO(sbi, lstart),
+		GET_SEGNO(sbi, lstart + len - 1) - GET_SEGNO(sbi, lstart) + 1);
 }
