@@ -1021,6 +1021,13 @@ int f2fs_swod_init(struct f2fs_sb_info *sbi)
 	if (!dcc->swod_overlap_skip_ratio_bp)
 		dcc->swod_overlap_skip_ratio_bp = 5000;
 
+	/* V6: init background eval task */
+	sw->sbi = sbi;
+	sw->eval_batch_size = 16;  /* eval 16 groups per batch */
+	sw->eval_next_gid = 0;
+	atomic_set(&sw->eval_running, 0);
+	INIT_DELAYED_WORK(&sw->eval_work, f2fs_swod_eval_work);
+
 	dcc->swod = sw;
 	return 0;
 }
@@ -1034,6 +1041,8 @@ void f2fs_swod_destroy(struct f2fs_sb_info *sbi)
 		return;
 
 	sw = dcc->swod;
+	/* V6: cancel background eval */
+	f2fs_swod_cancel_eval(sbi);
 	kvfree(sw->seg_hint);
 	kvfree(sw->grp_hint);
 	kvfree(sw->hold_segmap);
@@ -1489,4 +1498,101 @@ bool f2fs_swod_mark_held_cmd(struct f2fs_sb_info *sbi, block_t lstart, block_t l
 	/* check segment range of this cmd against held segmap */
 	return f2fs_swod_range_held(sbi, GET_SEGNO(sbi, lstart),
 		GET_SEGNO(sbi, lstart + len - 1) - GET_SEGNO(sbi, lstart) + 1);
+}
+
+/*
+ * V6: Background eval work - periodic round-robin evaluation of groups.
+ * Schedules itself after each batch to avoid blocking discard path.
+ */
+void f2fs_swod_eval_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct swod_ctrl *sw = container_of(dwork, struct swod_ctrl, eval_work);
+	struct f2fs_sb_info *sbi = sw->sbi;
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	unsigned long now = jiffies;
+	unsigned int batch_size;
+	unsigned int start_gid, gid;
+	unsigned int evaluated = 0;
+	unsigned int held_before, held_after;
+	unsigned int batch_delay_ms;
+
+	if (!swod_enabled(dcc))
+		return;
+
+	/* Prevent concurrent eval */
+	if (!atomic_cmpxchg(&sw->eval_running, 0, 1))
+		return;
+
+	held_before = READ_ONCE(sw->nr_held_groups);
+	batch_size = sw->eval_batch_size;
+	start_gid = sw->eval_next_gid;
+
+	/* Evaluate a batch of groups */
+	for (gid = start_gid;
+	     evaluated < batch_size && gid < sw->nr_groups;
+	     gid++, evaluated++) {
+		swod_eval_group_locked(sbi, gid, now);
+	}
+
+	/* Update cursor for next batch */
+	sw->eval_next_gid = gid < sw->nr_groups ? gid : 0;
+
+	/* Release eval lock */
+	atomic_set(&sw->eval_running, 0);
+
+	held_after = READ_ONCE(sw->nr_held_groups);
+
+	/* Sweep timeout before next eval */
+	f2fs_swod_sweep_timeout(sbi, now);
+
+	/* Schedule next batch if there are more groups */
+	if (gid < sw->nr_groups) {
+		/* Faster polling if there are active held windows */
+		batch_delay_ms = held_after > 0 ? 200 : 1000;
+		queue_delayed_work(system_unbound_wq, &sw->eval_work,
+				   msecs_to_jiffies(batch_delay_ms));
+	} else {
+		/* Full scan complete, idle delay before next round */
+		queue_delayed_work(system_unbound_wq, &sw->eval_work,
+				   msecs_to_jiffies(5000));
+	}
+}
+
+/*
+ * V6: Queue background eval if not already running.
+ * Safe to call from discard path.
+ */
+void f2fs_swod_queue_eval(struct f2fs_sb_info *sbi)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
+		return;
+
+	sw = dcc->swod;
+
+	/* Don't queue if work is already pending or running */
+	if (sw->eval_work.work.func != NULL &&
+	    !delayed_work_pending(&sw->eval_work) &&
+	    !atomic_read(&sw->eval_running)) {
+		queue_delayed_work(system_unbound_wq, &sw->eval_work,
+				   msecs_to_jiffies(100));
+	}
+}
+
+/*
+ * V6: Cancel background eval on shutdown.
+ */
+void f2fs_swod_cancel_eval(struct f2fs_sb_info *sbi)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
+		return;
+
+	sw = dcc->swod;
+	cancel_delayed_work_sync(&sw->eval_work);
 }

@@ -1071,6 +1071,37 @@ static struct discard_cmd *__create_discard_cmd(struct f2fs_sb_info *sbi,
     dc->enq_jiffies = jiffies;   /* SWOD: age tracking */
     dc->swod_skip = 0;
 
+    /*
+     * V6: create 时增量更新 seg_hint（O(nr_segs)，非 O(cmd_cnt)）
+     * 不再调用 f2fs_swod_refresh_around_locked()，避免 O(n) rb-tree 遍历
+     */
+    if (dcc->swod_enable && dcc->swod) {
+        struct swod_ctrl *sw = dcc->swod;
+        struct swod_seg_hint *h;
+        block_t cur = lstart;
+        block_t end = lstart + len;
+        unsigned int s;
+        block_t seg_end, piece;
+
+        while (cur < end) {
+            s = GET_SEGNO(sbi, cur);
+            if (s >= sw->nr_main_segs)
+                break;
+            h = &sw->seg_hint[s];
+            seg_end = START_BLOCK(sbi, s + 1);
+            piece = min(end, seg_end) - cur;
+
+            h->pend_blks += piece;
+            h->nr_cmds++;
+            if (!h->oldest_jiffies || time_before(jiffies, h->oldest_jiffies))
+                h->oldest_jiffies = jiffies;
+
+            cur += piece;
+        }
+        /* V6: trigger background eval after seg_hint update */
+        f2fs_swod_queue_eval(sbi);
+    }
+
     atomic_inc(&dcc->discard_cmd_cnt);
     dcc->undiscard_blks += len;
     /* lch: discard cmd creation log */
@@ -1438,15 +1469,31 @@ submit:
 	/*
 	 * V4.5: submit 时增量更新 seg_hint
 	 */
+	/*
+	 * V6: submit 时增量更新 seg_hint（O(nr_segs)，支持跨 segment）
+	 */
 	if (dcc->swod_enable && dcc->swod && orig_len) {
 		struct swod_ctrl *sw = dcc->swod;
-		unsigned int segno = GET_SEGNO(sbi, orig_lstart);
-		if (segno < sw->nr_main_segs) {
-			struct swod_seg_hint *h = &sw->seg_hint[segno];
-			if (h->pend_blks >= orig_len)
-				h->pend_blks -= orig_len;
+		struct swod_seg_hint *h;
+		block_t cur = orig_lstart;
+		block_t end = orig_lstart + orig_len;
+		unsigned int s;
+		block_t seg_end, piece;
+
+		while (cur < end) {
+			s = GET_SEGNO(sbi, cur);
+			if (s >= sw->nr_main_segs)
+				break;
+			h = &sw->seg_hint[s];
+			seg_end = START_BLOCK(sbi, s + 1);
+			piece = min(end, seg_end) - cur;
+
+			if (h->pend_blks >= piece)
+				h->pend_blks -= piece;
 			if (h->nr_cmds)
 				h->nr_cmds--;
+
+			cur += piece;
 		}
 	}
 	return err;

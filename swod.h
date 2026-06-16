@@ -72,6 +72,7 @@ struct swod_group_hint {
 };
 
 struct swod_ctrl {
+	struct f2fs_sb_info *sbi;          /* backpointer */
 	unsigned int nr_main_segs;
 	unsigned int win_segs;
 	unsigned int nr_groups;
@@ -125,6 +126,12 @@ struct swod_ctrl {
 	atomic64_t capture_release_cnt;
 	atomic64_t mature_release_cnt;
 	atomic64_t bypass_release_cnt;
+
+	/* V6: background eval task */
+	struct delayed_work eval_work;      /* periodic eval task */
+	unsigned int eval_batch_size;       /* groups per eval batch */
+	unsigned int eval_next_gid;         /* round-robin cursor */
+	atomic_t eval_running;             /* prevent concurrent eval */
 };
 
 int  f2fs_swod_init(struct f2fs_sb_info *sbi);
@@ -159,4 +166,9 @@ bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno);
 
 bool f2fs_swod_should_frag_ipu(struct inode *inode,
 			       struct f2fs_io_info *fio);
+
+/* V6: background eval interface */
+void f2fs_swod_eval_work(struct work_struct *work);
+void f2fs_swod_queue_eval(struct f2fs_sb_info *sbi);
+void f2fs_swod_cancel_eval(struct f2fs_sb_info *sbi);
 #endif
