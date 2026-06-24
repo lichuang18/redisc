@@ -363,34 +363,10 @@ static inline bool swod_wce_enabled(struct f2fs_sb_info *sbi, int gc_type)
 
 	if (gc_type == BG_GC)
 		return !!dcc->swod_gc_bg_enable;
-	// 现在的 urgent 策略已经从“完全禁用”变成“允许，但窗口更小
-	// WCE 就不该在 GC_URGENT_HIGH 上再单独硬 bypass，
-	// 否则策略还是不对齐：SWOD 能 hold，小窗口也能建，
-	// 但 FG urgent-high 却不去 completion。
 	if (gc_type == FG_GC)
 		return !!dcc->swod_gc_fg_enable;
 
 	return false;
-}
-
-static inline bool swod_wce_match(struct f2fs_sb_info *sbi,
-				  unsigned int segno,
-				  unsigned int nr_segs)
-{
-	return f2fs_swod_range_wce_target(sbi, segno, nr_segs);
-}
-
-static inline void swod_wce_account_pick(struct f2fs_sb_info *sbi, int gc_type)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-
-	if (!dcc || !dcc->swod)
-		return;
-
-	if (gc_type == BG_GC)
-		atomic64_inc(&dcc->swod->gc_pick_bg_cnt);
-	else if (gc_type == FG_GC)
-		atomic64_inc(&dcc->swod->gc_pick_fg_cnt);
 }
 // wce over
 
@@ -678,30 +654,64 @@ static void release_victim_entry(struct f2fs_sb_info *sbi)
  * When it is called from SSR segment selection, it finds a segment
  * which has minimum valid blocks and removes it from dirty seglist.
  */
+
 static int get_victim_by_default(struct f2fs_sb_info *sbi,
 			unsigned int *result, int gc_type, int type,
 			char alloc_mode, unsigned long long age)
 {
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	struct sit_info *sm = SIT_I(sbi);
 	struct victim_sel_policy p;
 	unsigned int secno, last_victim;
 	unsigned int last_segment;
+	unsigned int segno;
 	unsigned int nsearched;
 	bool is_atgc;
-	bool swod_target_pass;
+	bool wce_enabled;
 	int ret = 0;
 
+	/* V4: WCE 使能检查（使用 swod_wce_enabled 包含 BG/FG enable 检查） */
+	wce_enabled = swod_wce_enabled(sbi, gc_type) && (alloc_mode == LFS);
+
+	/* V4: WCE 优先从 held_segmap（SWOD 评估后的 bitmap）中选 dirty segment */
+	if (wce_enabled && f2fs_swod_has_held(sbi)) {
+		select_policy(sbi, gc_type, type, &p);
+		last_segment = MAIN_SECS(sbi) * sbi->segs_per_sec;
+
+		/* 从 held_segmap 中找 dirty segment */
+		segno = f2fs_swod_pick_held_dirty(sbi, p.dirty_bitmap, last_segment);
+		if (segno) {
+			secno = GET_SEC_FROM_SEG(sbi, segno);
+			if (!sec_usage_check(sbi, secno)) {
+				*result = segno;
+				if (alloc_mode == LFS) {
+					if (gc_type == FG_GC)
+						sbi->cur_victim_sec = secno;
+					else
+						set_bit(secno, dirty_i->victim_secmap);
+				}
+				if (gc_type == BG_GC)
+					atomic64_inc(&dcc->swod->gc_pick_bg_cnt);
+				else
+					atomic64_inc(&dcc->swod->gc_pick_fg_cnt);
+
+				/* 选中后释放 held 状态 */
+				f2fs_swod_notify_gc_done(sbi, segno);
+				return 0;
+			}
+			/* held dirty 但不合法，fallback 到 stock GC */
+			atomic64_inc(&dcc->swod->gc_fallback_cnt);
+		}
+	}
+
+	/* 原有的 victim 选取逻辑 */
 	mutex_lock(&dirty_i->seglist_lock);
 	last_segment = MAIN_SECS(sbi) * sbi->segs_per_sec;
 
 	p.alloc_mode = alloc_mode;
 	p.age = age;
 	p.age_threshold = sbi->am.age_threshold;
-	// wce入口条件 
-	swod_target_pass = (alloc_mode == LFS) &&
-			swod_wce_enabled(sbi, gc_type) &&
-			f2fs_swod_has_wce_target(sbi);
 
 retry:
 	select_policy(sbi, gc_type, type, &p);
@@ -733,10 +743,7 @@ retry:
 		goto out;
 
 	if (__is_large_section(sbi) && p.alloc_mode == LFS) {
-		if (sbi->next_victim_seg[BG_GC] != NULL_SEGNO &&
-		    (!swod_target_pass ||
-		     swod_wce_match(sbi, sbi->next_victim_seg[BG_GC],
-				    p.ofs_unit))) {
+		if (sbi->next_victim_seg[BG_GC] != NULL_SEGNO) {
 			p.min_segno = sbi->next_victim_seg[BG_GC];
 			*result = p.min_segno;
 			sbi->next_victim_seg[BG_GC] = NULL_SEGNO;
@@ -744,10 +751,7 @@ retry:
 		}
 
 		if (gc_type == FG_GC &&
-		    sbi->next_victim_seg[FG_GC] != NULL_SEGNO &&
-		    (!swod_target_pass ||
-		     swod_wce_match(sbi, sbi->next_victim_seg[FG_GC],
-				    p.ofs_unit))) {
+		    sbi->next_victim_seg[FG_GC] != NULL_SEGNO) {
 			p.min_segno = sbi->next_victim_seg[FG_GC];
 			*result = p.min_segno;
 			sbi->next_victim_seg[FG_GC] = NULL_SEGNO;
@@ -756,14 +760,12 @@ retry:
 	}
 
 	last_victim = sm->last_victim[p.gc_mode];
+
+	/* V3 WCE: 只在 victim 挑选循环中跳过 held segment */
 	if (p.alloc_mode == LFS && gc_type == FG_GC) {
 		p.min_segno = check_bg_victims(sbi);
-		if (p.min_segno != NULL_SEGNO) {
-			if (!swod_target_pass ||
-			    swod_wce_match(sbi, p.min_segno, p.ofs_unit))
-				goto got_it;
-			p.min_segno = NULL_SEGNO;
-		}
+		if (p.min_segno != NULL_SEGNO)
+			goto got_result;
 	}
 
 	while (1) {
@@ -787,8 +789,7 @@ retry:
 		}
 
 		p.offset = segno + p.ofs_unit;
-		if (!swod_target_pass)
-			nsearched++;
+		nsearched++;
 
 #ifdef CONFIG_F2FS_CHECK_FS
 		/*
@@ -804,6 +805,12 @@ retry:
 
 		if (sec_usage_check(sbi, secno))
 			goto next;
+
+	/* V4 WCE: 优先选 held segment（暂时注释，后续实现 target-first 逻辑） */
+		/* if (wce_enabled && f2fs_swod_seg_held(sbi, segno)) { */
+		/* 	atomic64_inc(&dcc->swod->gc_skip_held_cnt); */
+		/* 	goto next; */
+		/* } */
 
 		/* Don't touch checkpointed data */
 		if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
@@ -827,13 +834,6 @@ retry:
 
 		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
 			goto next;
-
-		// 当 swod_target_pass == true 时，只有真正命中 WCE 目标的候选才消耗搜索预算
-		if (swod_target_pass) {
-			if (!swod_wce_match(sbi, segno, p.ofs_unit))
-				goto next;
-			nsearched++;
-		}
 
 		if (is_atgc) {
 			add_victim_entry(sbi, &p, segno);
@@ -870,27 +870,12 @@ next:
 		p.age_threshold = 0;
 		goto retry;
 	}
-	/* 
-	第一次扫描：只看 held-window 目标集；
-	如果目标集里一个合法 victim 都没有：回退到 stock picker；
-	只回退一次，不搞多轮复杂状态机。
-	*/
-	if (p.min_segno == NULL_SEGNO && swod_target_pass) {
-		struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 
-		swod_target_pass = false;
-		if (dcc && dcc->swod)
-			atomic64_inc(&dcc->swod->gc_fallback_cnt);
-		goto retry;
-	}
+	/* V3 WCE: held segment 跳过在循环中处理 */
 
 	if (p.min_segno != NULL_SEGNO) {
-got_it:
 		*result = (p.min_segno / p.ofs_unit) * p.ofs_unit;
 got_result:
-		if (swod_target_pass)
-			swod_wce_account_pick(sbi, gc_type);
-
 		if (p.alloc_mode == LFS) {
 			secno = GET_SEC_FROM_SEG(sbi, p.min_segno);
 			if (gc_type == FG_GC)

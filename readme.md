@@ -22,7 +22,7 @@ SWOD 的设计初衷如下：
 
 1. **SWOD**：在 pending discard 队列之上识别并 hold 高价值窗口；
 2. **WCE（主路径）**：围绕这些 held windows 优先做 completion，让窗口更快接近 `READY-FOR-MATERIALIZATION`；
-3. **Selective Fragment IPU / SFI（辅路径）**：只在 LFS 场景下，对 non-target zone 中少量“小、碎、老、非热”的 fragment 给一次很窄的 IPU 例外，以减少新的 tiny discard 继续形成。
+3. **HBU（可选）**：在 hbu_targets 上做 OPU 分配，填满无效块空间，减少碎片化 discard cmd。
 
 SWOD 只解决以下问题：
 
@@ -32,11 +32,11 @@ SWOD 只解决以下问题：
 
 > 当 SWOD 已经保住一些 held windows 之后，如何让 GC 优先围绕这些目标段工作，使窗口更快成熟？
 
-本版 SFI 解决的问题是：
+本版 HBU 解决的问题是：
 
-> 在不干扰 held windows completion 的前提下，如何尽量少让 non-target zone 继续长出更多 tiny discard / partial-invalid fragments？
+> 如何在高有效块、高碎片化的 segment 上做 OPU 分配，减少碎片化 discard cmd 的数量？
 
-SWOD / WCE / SFI **都不负责**：
+SWOD / WCE / HBU **都不负责**：
 
 - 直接重写 `ipu_policy`
 - 直接修改 `alloc_mode`
@@ -52,7 +52,7 @@ SWOD / WCE / SFI **都不负责**：
 3. **在系统高压时及时让路**
 4. **向 WCE 暴露 held target set**
 5. **在 GC 侧优先清理 held windows 中仍残留 live blocks 的段**
-6. **在 non-target zone 上仅对少量高性价比旧碎片提供一次窄 IPU 例外**
+6. **在 hbu_targets 上做 OPU 分配，减少碎片化 discard cmd**
 7. **仍由 stock F2FS 负责最终 materialization 与 issue**
 
 ---
@@ -274,15 +274,15 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 
 ---
 
-## 5. 最终方案：WCE 为主，Selective Fragment IPU 为辅
+## 5. 最终方案：WCE 为主，HBU 为辅
 
 ### 5.1 总体定位
 
 这次定稿后的 discard 研究设计采用：
 
 - **WCE 为主路径**：继续让 SWOD 先识别并 hold 高价值窗口，再由 WCE 围绕这些 held windows 优先做 completion；
-- **Selective Fragment IPU（SFI）为辅路径**：只在 LFS 场景下，对 non-target zone 中极少量“小、碎、老、非热”的 fragment 给一次很窄的 IPU 例外；
-- **stock F2FS 负责 materialization**：SWOD / WCE / SFI 都不直接伪造大 discard，真正的连续 discard run 仍通过 stock F2FS 的 checkpoint / prefree / issue path 自然形成。
+- **HBU 为辅路径**：在高有效块、高碎片化的 segment 上做 OPU 分配，填满无效块空间，减少碎片化 discard cmd 数量；
+- **stock F2FS 负责 materialization**：SWOD / WCE / HBU 都不直接伪造大 discard，真正的连续 discard run 仍通过 stock F2FS 的 checkpoint / prefree / issue path 自然形成。
 
 也就是说，这版不是“全局转向 IPU”，而是：
 
@@ -305,36 +305,21 @@ N_{held}^{max} = \min(nr\_groups,\ swod\_max\_held\_groups)
 - 让窗口更快沿着 `NORMAL -> HELD -> NEAR-COMPLETE -> READY-FOR-MATERIALIZATION` 演化；
 - 最终由 stock F2FS 自然 materialize 成更连续的 discard run。
 
-### 5.3 Selective Fragment IPU（SFI）辅路径
+### 5.3 HBU 辅路径
 
-SFI 不是全局 IPU 策略，而是一个非常窄的辅助路径。
+HBU（Hold Block Utilization）是一个在高有效块 segment 上做 OPU 分配的辅助机制。
 
-它只在以下前提下考虑放行：
+它只在以下前提下考虑启用：
 
-- 当前系统处于 `LFS` 场景；
-- 当前 SWOD 仍然有 held windows；
-- 旧块所在 segment **不属于 held target window**；
-- 该 segment 表现为“小、碎、老、非热”的 pending-discard fragment。
+- `swod_hbu_enable = 1`
+- segment 有效块比例 >= `swod_hbu_valid_thr_bp`（默认 80%）
+- segment 的 discard cmd 数量 >= `swod_hbu_min_cmds`（默认 4，表示高碎片化）
+- segment 不在 held_segmap 中（与 SWOD hold 互斥）
 
-其筛选依据直接复用 SWOD 已维护的 segment 侧摘要：
-
-- `pend_blks`：该 segment 内当前可见 pending discard 块数
-- `nr_cmds`：该 segment 的碎片度
-- `oldest_jiffies`：这些 pending fragment 的年龄
-- `hold_segmap / nr_held_groups`：该 segment 是否属于 held target，以及系统当前是否还有 held windows
-
-再叠加：
-
-- non-target only
-- skip hot data
-- age threshold
-- tiny fragment threshold
-
-SFI 的目标不是帮助 held window completion，而是：
-
-- 不去动 held windows；
-- 尽量少让其他地方继续长出新的 tiny discard；
-- 作为 WCE 主路径之外的一个 source-side shaping 辅助动作。
+HBU 的目标是：
+- 在高碎片化 segment 上做 OPU 分配，填满无效块空间
+- 减少碎片化 discard cmd 的数量
+- 作为 WCE 主路径之外的一个辅助动作
 
 ### 5.4 为什么这次不把 SSR 当主策略
 
@@ -343,7 +328,7 @@ SFI 的目标不是帮助 held window completion，而是：
 因此，在当前代码基线下：
 
 - SSR 并不是一个可以自然承接这版 shaping 设计的主通路；
-- 更现实的落点是：保持 WCE 作为 completion 主路径，再通过一个非常窄的 fragment-IPU 例外去抑制 non-target zone 的 tiny fragment 继续增长。
+- 更现实的落点是：保持 WCE 作为 completion 主路径，再通过 HBU 做 OPU 分配辅助。
 
 ### 5.5 运行语义
 
@@ -351,13 +336,13 @@ SFI 的目标不是帮助 held window completion，而是：
 
 1. SWOD 继续负责 `identify / hold / skip / release`；
 2. WCE 在 held windows 上优先做 completion；
-3. SFI 只在 non-target zone 上做极窄的 fragment-IPU 辅助；
+3. HBU 在 hbu_targets 上做 OPU 分配；
 4. 三者都不直接 issue discard，也不直接伪造大 discard；
 5. 真正的 discard materialization 仍交给 stock F2FS。
 
 因此，这一版形成的是：
 
-> **SWOD 保住机会窗口，WCE 优先清掉 held windows 里的 residual live blocks，SFI 只在 non-target zone 上抑制新的 tiny fragment 继续形成，最终仍由 stock F2FS 自然 materialize 成更连续的 discard。**
+> **SWOD 保住机会窗口，WCE 优先清掉 held windows 里的 residual live blocks，HBU 在高碎片化 segment 上做 OPU 分配减少 discard cmd，最终仍由 stock F2FS 自然 materialize 成更连续的 discard。**
 
 ## 6. 代码改动概述
 
@@ -378,16 +363,16 @@ SFI 的目标不是帮助 held window completion，而是：
 - `f2fs_swod_range_held()`
 - `f2fs_swod_seg_held()`
 
-同时在 `struct swod_ctrl` 中增加了 WCE / SFI 统计项：
+同时在 `struct swod_ctrl` 中增加了 WCE / HBU 统计项：
 
 - `gc_pick_bg_cnt`
 - `gc_pick_fg_cnt`
 - `gc_fallback_cnt`
-- `frag_ipu_pick_cnt`
-- `frag_ipu_skip_target_cnt`
-- `frag_ipu_skip_hot_cnt`
-- `frag_ipu_skip_age_cnt`
-- `frag_ipu_skip_shape_cnt`
+- `hbu_target_add_cnt`
+- `hbu_target_rm_cnt`
+- `hbu_alloc_success_cnt`
+- `hbu_alloc_skip_held_cnt`
+- `hbu_alloc_skip_full_cnt`
 
 #### `fs/f2fs/swod.c`
 实现 SWOD 核心逻辑，包括：
@@ -398,7 +383,6 @@ SFI 的目标不是帮助 held window completion，而是：
 - hold/release 状态维护
 - issue 路径 skip 判定
 - 面向 WCE 的 held target 查询接口
-- 面向 SFI 的 fragment-IPU advisory selector
 
 ---
 
@@ -429,18 +413,16 @@ SFI 的目标不是帮助 held window completion，而是：
    - `swod_gc_bg_enable`
    - `swod_gc_fg_enable`
 
-4. 在 `struct discard_cmd_control` 中增加 SFI 开关与阈值：
-   - `swod_frag_ipu_enable`
-   - `swod_frag_ipu_max_pend_blks`
-   - `swod_frag_ipu_min_cmds`
-   - `swod_frag_ipu_age_ms`
-   - `swod_frag_ipu_skip_hot`
+4. 在 `struct discard_cmd_control` 中增加 HBU 开关与阈值：
+   - `swod_hbu_enable`
+   - `swod_hbu_valid_thr_bp`
+   - `swod_hbu_min_cmds`
 
 作用：
 
 - 将 SWOD 作为 discard 子系统的一层附加状态，绑定到 `discard_cmd_control` 生命周期；
 - 允许在运行时单独控制 target-first WCE 是否生效，以及 BG/FG GC 是否参与；
-- 允许在 non-target zone 上启用一个很窄的 fragment-IPU 辅助路径。
+- 允许启用 HBU 在高碎片化 segment 上做 OPU 分配。
 
 ---
 
@@ -501,7 +483,7 @@ SFI 的目标不是帮助 held window completion，而是：
 
 主要改动：
 
-新增 SWOD / WCE / SFI 的 sysfs 参数与统计：
+新增 SWOD / WCE / HBU 的 sysfs 参数与统计：
 
 ##### 可写参数
 - `swod_enable`
@@ -516,11 +498,9 @@ SFI 的目标不是帮助 held window completion，而是：
 - `swod_completion_enable`
 - `swod_gc_bg_enable`
 - `swod_gc_fg_enable`
-- `swod_frag_ipu_enable`
-- `swod_frag_ipu_max_pend_blks`
-- `swod_frag_ipu_min_cmds`
-- `swod_frag_ipu_age_ms`
-- `swod_frag_ipu_skip_hot`
+- `swod_hbu_enable`
+- `swod_hbu_valid_thr_bp`
+- `swod_hbu_min_cmds`
 
 ##### 只读统计
 - `swod_held_groups`
@@ -532,11 +512,12 @@ SFI 的目标不是帮助 held window completion，而是：
 - `swod_gc_pick_bg_cnt`
 - `swod_gc_pick_fg_cnt`
 - `swod_gc_fallback_cnt`
-- `swod_frag_ipu_pick_cnt`
-- `swod_frag_ipu_skip_target_cnt`
-- `swod_frag_ipu_skip_hot_cnt`
-- `swod_frag_ipu_skip_age_cnt`
-- `swod_frag_ipu_skip_shape_cnt`
+- `swod_hbu_target_cnt`
+- `swod_hbu_target_add_cnt`
+- `swod_hbu_target_rm_cnt`
+- `swod_hbu_alloc_success_cnt`
+- `swod_hbu_alloc_skip_held_cnt`
+- `swod_hbu_alloc_skip_full_cnt`
 
 说明：
 
@@ -629,10 +610,8 @@ SWOD 的动作是：
 3. 仅对完全落在 held 子窗口内部的命令做 skip；
 4. WCE 采用 target-first completion，而不是 `gain(s)` / tie-break 软偏置；
 5. `f2fs_swod_range_held()` 目前只基于 held bitmap 做范围命中判断；
-6. SFI 只在 LFS 场景、且存在 held windows 时生效；
-7. SFI 只针对 non-target、tiny、fragmented、aged、non-hot 旧碎片；
-8. SSR 不作为当前版本的主路径，因为当前代码基线下 `f2fs_need_SSR()` 在 `f2fs_lfs_mode(sbi)` 下直接返回 `false`；
-9. 不主动提交“materialized”大 discard，而是交由 stock F2FS 自然处理。
+6. HBU 只在高有效块、高碎片化 segment 上启用；
+7. held_segmap 和 hbu_segmap 互斥；
 
 这些边界是有意保留的，目的在于：
 
@@ -652,11 +631,9 @@ SWOD 的动作是：
 - `swod_completion_enable`
 - `swod_gc_bg_enable`
 - `swod_gc_fg_enable`
-- `swod_frag_ipu_enable`
-- `swod_frag_ipu_max_pend_blks`
-- `swod_frag_ipu_min_cmds`
-- `swod_frag_ipu_age_ms`
-- `swod_frag_ipu_skip_hot`
+- `swod_hbu_enable`
+- `swod_hbu_valid_thr_bp`
+- `swod_hbu_min_cmds`
 - `swod_held_groups`
 - `swod_hold_cnt`
 - `swod_skip_cnt`
@@ -665,11 +642,12 @@ SWOD 的动作是：
 - `swod_gc_pick_bg_cnt`
 - `swod_gc_pick_fg_cnt`
 - `swod_gc_fallback_cnt`
-- `swod_frag_ipu_pick_cnt`
-- `swod_frag_ipu_skip_target_cnt`
-- `swod_frag_ipu_skip_hot_cnt`
-- `swod_frag_ipu_skip_age_cnt`
-- `swod_frag_ipu_skip_shape_cnt`
+- `swod_hbu_target_cnt`
+- `swod_hbu_target_add_cnt`
+- `swod_hbu_target_rm_cnt`
+- `swod_hbu_alloc_success_cnt`
+- `swod_hbu_alloc_skip_held_cnt`
+- `swod_hbu_alloc_skip_full_cnt`
 
 ### 原有 F2FS/Discard 指标
 - `pending_discard`
@@ -689,8 +667,7 @@ SWOD 的动作是：
 - WCE 是否真的在 held target 上 pick 到 victim；
 - fallback 是否过多；
 - held windows 的 residual live 是否下降得更快；
-- SFI 是否只在 non-target old fragments 上被放行；
-- SFI 是否在减少 tiny fragment 的继续增长。
+- HBU 是否在高碎片化 segment 上成功做 OPU 分配；
 
 ---
 
@@ -699,7 +676,7 @@ SWOD 的动作是：
 当前版本已经记录了这轮 discard 研究设计的最终实现口径：
 
 - 主路径是 WCE completion；
-- 辅路径是 non-target zone 上的 Selective Fragment IPU；
+- 辅路径是 HBU OPU 分配；
 - materialization 仍交给 stock F2FS。
 
 后续若继续修改，应视为新一轮演进，而不是本轮设计定义的一部分。阅读本文件即可快速恢复：
@@ -712,15 +689,15 @@ SWOD 的动作是：
 
 ## 12. 总结
 
-当前版本的本质不是“更激进地发出更长 discard”，而是：
+当前版本的本质不是”更激进地发出更长 discard”，而是：
 
-> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再由 WCE 优先围绕 held windows 清理 residual live blocks，同时只在 non-target zone 上用一个很窄的 fragment-IPU 例外去抑制新的 tiny fragment 继续增长，最终仍由 stock F2FS 自然完成 materialization 与 issue。
+> 在 issue 侧先识别并保留那些未来有潜力长成更连续 segment-run discard 的局部机会窗口，再由 WCE 优先围绕 held windows 清理 residual live blocks，同时通过 HBU 在高碎片化 segment 上做 OPU 分配减少 discard cmd，最终仍由 stock F2FS 自然完成 materialization 与 issue。
 
 通过这一设计，系统已经形成了一个清晰的最终版闭环：
 
 - **SWOD** 负责识别并保住机会；
 - **WCE** 负责把 held windows 尽快推向可 materialize 状态；
-- **SFI** 负责在不碰 held target 的前提下，减少 non-target zone 继续产生更多 tiny discard；
+- **HBU** 负责在高碎片化 segment 上做 OPU 分配，减少碎片化 discard cmd；
 - **stock F2FS** 负责真正的连续 discard materialization 与 issue
 
 
@@ -738,7 +715,6 @@ Let WCE keep useful GC targets even when SWOD-held windows time out or are press
 - On `SWOD_REL_TIMEOUT` or `SWOD_REL_PRESSURE`, try to convert a `HELD` window into a parked WCE target instead of dropping it immediately.
 - Parked windows still block overlapping discard commands, so pending discard ranges can continue to merge.
 - WCE target lookup sees `HELD || PARKED`.
-- SFI (`f2fs_swod_should_frag_ipu`) still only sees `HELD`, so parked targets do not broaden that policy.
 - Explicit bypass / release-all paths drop both HELD and PARKED directly.
 
 ## Key filters for parking

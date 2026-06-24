@@ -1885,6 +1885,8 @@ static int issue_discard_thread(void *data)
 	wait_queue_head_t *q = &dcc->discard_wait_queue;
 	struct discard_policy dpolicy;
 	unsigned int wait_ms = DEF_MIN_DISCARD_ISSUE_TIME;
+	unsigned long next_eval = 0;
+	unsigned long now;
 	int issued;
 
 	set_freezable();
@@ -1892,7 +1894,16 @@ static int issue_discard_thread(void *data)
 	do {
 		bool urgent_force = sbi->gc_mode == GC_URGENT_HIGH;
 
-			
+		now = jiffies;
+
+		/* 周期性后台评估：每 100ms 评估一次，与 issue 周期解耦
+		 * 不影响 IO 路径，trylock 失败则跳过
+		 */
+		if (dcc->swod_enable && time_after_eq(now, next_eval)) {
+			f2fs_swod_periodic_scan(sbi, now);
+			next_eval = now + msecs_to_jiffies(100);
+		}
+
 		if (urgent_force ||
 		    !f2fs_available_free_memory(sbi, DISCARD_CACHE))
 			__init_discard_policy(sbi, &dpolicy, DPOLICY_FORCE, 1);
@@ -2319,17 +2330,17 @@ static int create_discard_cmd_control(struct f2fs_sb_info *sbi)
 		dcc->swod_hold_scale_bp = 10000;
 	dcc->swod_cmd_pressure = 4096;
 	dcc->swod_blk_pressure = 1 << 20;
-	dcc->swod_max_held_groups = 64;
+	dcc->swod_max_held_groups = 128;
 
 	dcc->swod_completion_enable = 0;
 	dcc->swod_gc_bg_enable = 1;
 	dcc->swod_gc_fg_enable = 1;
 
-	dcc->swod_frag_ipu_enable = 0;
-	dcc->swod_frag_ipu_max_pend_blks = 32; // 只盯着very small fragment
-	dcc->swod_frag_ipu_min_cmds = 2; // 至少是碎的
-	dcc->swod_frag_ipu_age_ms = 5000;// 先只碰更老的
-	dcc->swod_frag_ipu_skip_hot = 1;// 热数据默认不碰
+	// V4: HBU 参数
+	dcc->swod_hbu_enable = 0;           /* 默认关闭，实验时再开 */
+	dcc->swod_hbu_valid_thr_bp = 8000;  /* 80% 有效块阈值 */
+	dcc->swod_hbu_min_cmds = 4;         /* nr_cmds 碎片化阈值 */
+
 	dcc->swod = NULL;
 
 	init_waitqueue_head(&dcc->discard_wait_queue);
@@ -3635,11 +3646,55 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			get_atssr_segment(sbi, type, se->type,
 						AT_SSR, se->mtime);
 		} else {
-			if (need_new_seg(sbi, type))
-				new_curseg(sbi, type, false);
-			else
-				change_curseg(sbi, type);
-			stat_inc_seg_type(sbi, curseg);
+			unsigned int hbu_segno;
+			unsigned int orig_next_segno;
+
+			/*
+			 * V4: HBU OPU 分配
+			 * 前置条件：DATA 类型 + 非 HOT + 非覆写
+			 * 决策：curseg 切换时，优先从 hbu_targets 选 segment
+			 */
+			if (fio && fio->type == DATA && fio->temp != HOT &&
+			    old_blkaddr == NULL_ADDR) {
+				hbu_segno = f2fs_swod_hbu_alloc(sbi, type);
+			} else {
+				hbu_segno = NULL_SEGNO;
+			}
+
+			if (hbu_segno != NULL_SEGNO) {
+				/* HBU 成功：使用 HBU segment */
+				unsigned int free_blkoff;
+
+				orig_next_segno = curseg->next_segno;
+
+				/*
+				 * 切换 curseg 到 HBU segment
+				 * reset_curseg 会设置 curseg->segno = curseg->next_segno
+				 * 所以先设置 next_segno 为 hbu_segno
+				 */
+				curseg->next_segno = hbu_segno;
+				reset_curseg(sbi, type, 1);
+				curseg->alloc_type = LFS;
+
+				/* 恢复 orig_next_segno，脏 segment 用完后回归主线 */
+				curseg->next_segno = orig_next_segno;
+
+				/* 找到 HBU segment 的第一个空闲块位置 */
+				free_blkoff = __next_free_blkoff(sbi,
+					curseg->segno, 0);
+				curseg->next_blkoff = free_blkoff;
+
+				/* 更新 *new_blkaddr 为 HBU segment 的空闲块 */
+				*new_blkaddr = START_BLOCK(sbi, curseg->segno) +
+					free_blkoff;
+			} else {
+				/* HBU 不可用：使用原始分配流程 */
+				if (need_new_seg(sbi, type))
+					new_curseg(sbi, type, false);
+				else
+					change_curseg(sbi, type);
+				stat_inc_seg_type(sbi, curseg);
+			}
 		}
 	}
 	/*

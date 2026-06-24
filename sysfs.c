@@ -258,7 +258,7 @@ static ssize_t swod_held_groups_show(struct f2fs_attr *a,
 	if (!dcc || !dcc->swod)
 		return sysfs_emit(buf, "0\n");
 
-	return sysfs_emit(buf, "%u\n", dcc->swod->nr_held_groups);
+	return sysfs_emit(buf, "%d\n", atomic_read(&dcc->swod->nr_held_groups));
 }
 
 static ssize_t swod_hold_cnt_show(struct f2fs_attr *a,
@@ -419,11 +419,8 @@ static ssize_t _name##_show(struct f2fs_attr *a,			 \
 		(unsigned long long)atomic64_read(&dcc->swod->_field)); \
 }
 
-SWOD_COUNTER_SHOW(swod_frag_ipu_pick_cnt, frag_ipu_pick_cnt);
-SWOD_COUNTER_SHOW(swod_frag_ipu_skip_target_cnt, frag_ipu_skip_target_cnt);
-SWOD_COUNTER_SHOW(swod_frag_ipu_skip_hot_cnt, frag_ipu_skip_hot_cnt);
-SWOD_COUNTER_SHOW(swod_frag_ipu_skip_age_cnt, frag_ipu_skip_age_cnt);
-SWOD_COUNTER_SHOW(swod_frag_ipu_skip_shape_cnt, frag_ipu_skip_shape_cnt);
+SWOD_COUNTER_SHOW(swod_hold_high_cov_cnt, hold_high_cov_cnt);
+SWOD_COUNTER_SHOW(swod_hold_high_frag_cnt, hold_high_frag_cnt);
 
 // wce start
 static ssize_t swod_gc_pick_bg_cnt_show(struct f2fs_attr *a,
@@ -462,6 +459,26 @@ static ssize_t swod_gc_fallback_cnt_show(struct f2fs_attr *a,
 		(unsigned long long)atomic64_read(&dcc->swod->gc_fallback_cnt));
 }
 // wce over
+// V4: HBU start
+static ssize_t swod_hbu_target_cnt_show(struct f2fs_attr *a,
+		struct f2fs_sb_info *sbi, char *buf)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+
+	if (!dcc || !dcc->swod)
+		return sysfs_emit(buf, "0\n");
+
+	return sysfs_emit(buf, "%d\n",
+		atomic_read(&dcc->swod->nr_hbu_segs));
+}
+SWOD_COUNTER_SHOW(swod_hbu_target_add_cnt, hbu_target_add_cnt);
+SWOD_COUNTER_SHOW(swod_hbu_target_rm_cnt, hbu_target_rm_cnt);
+SWOD_COUNTER_SHOW(swod_hbu_ipu_pick_cnt, hbu_ipu_pick_cnt);
+SWOD_COUNTER_SHOW(swod_hbu_alloc_success_cnt, hbu_alloc_success_cnt);
+SWOD_COUNTER_SHOW(swod_hbu_alloc_skip_held_cnt, hbu_alloc_skip_held_cnt);
+SWOD_COUNTER_SHOW(swod_hbu_alloc_skip_full_cnt, hbu_alloc_skip_full_cnt);
+// HBU over
+
 static ssize_t f2fs_sbi_show(struct f2fs_attr *a,
 			struct f2fs_sb_info *sbi, char *buf)
 {
@@ -726,36 +743,6 @@ out:
 		return count;
 	}
 	// swod end
-	// sfi start
-	if (!strcmp(a->attr.name, "swod_frag_ipu_enable") ||
-	    !strcmp(a->attr.name, "swod_frag_ipu_skip_hot")) {
-		if (t > 1)
-			return -EINVAL;
-		*ui = (unsigned int)t;
-		return count;
-	}
-
-	if (!strcmp(a->attr.name, "swod_frag_ipu_min_cmds")) {
-		if (!t || t > 64)
-			return -EINVAL;
-		*ui = (unsigned int)t;
-		return count;
-	}
-
-	if (!strcmp(a->attr.name, "swod_frag_ipu_max_pend_blks")) {
-		if (!t || t > sbi->blocks_per_seg)
-			return -EINVAL;
-		*ui = (unsigned int)t;
-		return count;
-	}
-
-	if (!strcmp(a->attr.name, "swod_frag_ipu_age_ms")) {
-		if (!t || t > 600000)
-			return -EINVAL;
-		*ui = (unsigned int)t;
-		return count;
-	}
-	// sfi end
 	// wce start
 	if (!strcmp(a->attr.name, "swod_completion_enable") ||
 	    !strcmp(a->attr.name, "swod_gc_bg_enable") ||
@@ -766,6 +753,57 @@ out:
 		return count;
 	}
 	// wce over
+	// V4: 碎片化参数
+	if (!strcmp(a->attr.name, "swod_frag_thr_bp")) {
+		if (t > SWOD_BP_ONE)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_frag_timeout_k")) {
+		if (t == 0 || t > 10)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_frag_min_cmds")) {
+		if (t == 0 || t > 64)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_frag_max_avg_piece_blks")) {
+		if (t == 0)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_frag_min_total_pend")) {
+		if (t == 0)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+
+	// V4: HBU 参数
+	if (!strcmp(a->attr.name, "swod_hbu_enable")) {
+		if (t > 1)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_hbu_valid_thr_bp")) {
+		if (t > SWOD_BP_ONE)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
+	if (!strcmp(a->attr.name, "swod_hbu_min_cmds")) {
+		if (t == 0 || t > 64)
+			return -EINVAL;
+		*ui = (unsigned int)t;
+		return count;
+	}
 
 
 	if (!strcmp(a->attr.name, "migration_granularity")) {
@@ -1023,17 +1061,6 @@ F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_hold_max_ms, swod_hold_max_ms);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_cmd_pressure, swod_cmd_pressure);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_blk_pressure, swod_blk_pressure);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control, swod_max_held_groups, swod_max_held_groups);
-// sfi
-F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
-		swod_frag_ipu_enable, swod_frag_ipu_enable);
-F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
-		swod_frag_ipu_max_pend_blks, swod_frag_ipu_max_pend_blks);
-F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
-		swod_frag_ipu_min_cmds, swod_frag_ipu_min_cmds);
-F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
-		swod_frag_ipu_age_ms, swod_frag_ipu_age_ms);
-F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
-		swod_frag_ipu_skip_hot, swod_frag_ipu_skip_hot);
 
 // wce
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
@@ -1042,6 +1069,26 @@ F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
 		swod_gc_bg_enable, swod_gc_bg_enable);
 F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
 		swod_gc_fg_enable, swod_gc_fg_enable);
+
+// V4: 碎片化参数
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_thr_bp, swod_frag_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_timeout_k, swod_frag_timeout_k);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_min_cmds, swod_frag_min_cmds);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_max_avg_piece_blks, swod_frag_max_avg_piece_blks);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_frag_min_total_pend, swod_frag_min_total_pend);
+
+// V4: HBU 参数
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_hbu_enable, swod_hbu_enable);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_hbu_valid_thr_bp, swod_hbu_valid_thr_bp);
+F2FS_RW_ATTR(DCC_INFO, discard_cmd_control,
+		swod_hbu_min_cmds, swod_hbu_min_cmds);
 
 F2FS_RW_ATTR(RESERVED_BLOCKS, f2fs_sb_info, reserved_blocks, reserved_blocks);
 F2FS_RW_ATTR(SM_INFO, f2fs_sm_info, batched_trim_sections, trim_sections);
@@ -1093,6 +1140,8 @@ F2FS_GENERAL_RO_ATTR(main_blkaddr);
 // swod
 F2FS_GENERAL_RO_ATTR(swod_held_groups);
 F2FS_GENERAL_RO_ATTR(swod_hold_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hold_high_cov_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hold_high_frag_cnt);
 F2FS_GENERAL_RO_ATTR(swod_skip_cnt);
 F2FS_GENERAL_RO_ATTR(swod_success_release_cnt);
 F2FS_GENERAL_RO_ATTR(swod_timeout_release_cnt);
@@ -1105,17 +1154,19 @@ F2FS_GENERAL_RO_ATTR(swod_skip_miss_overlap_cnt);
 F2FS_GENERAL_RO_ATTR(swod_eval_blocked_cnt);
 F2FS_GENERAL_RO_ATTR(swod_eval_no_candidate_cnt);
 
-//sfi
-F2FS_GENERAL_RO_ATTR(swod_frag_ipu_pick_cnt);
-F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_target_cnt);
-F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_hot_cnt);
-F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_age_cnt);
-F2FS_GENERAL_RO_ATTR(swod_frag_ipu_skip_shape_cnt);
-
 // wce
 F2FS_GENERAL_RO_ATTR(swod_gc_pick_bg_cnt);
 F2FS_GENERAL_RO_ATTR(swod_gc_pick_fg_cnt);
 F2FS_GENERAL_RO_ATTR(swod_gc_fallback_cnt);
+
+// V4: HBU
+F2FS_GENERAL_RO_ATTR(swod_hbu_target_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_target_add_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_target_rm_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_ipu_pick_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_alloc_success_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_alloc_skip_held_cnt);
+F2FS_GENERAL_RO_ATTR(swod_hbu_alloc_skip_full_cnt);
 
 
 #ifdef CONFIG_F2FS_STAT_FS
@@ -1262,6 +1313,8 @@ static struct attribute *f2fs_attrs[] = {
 
 	ATTR_LIST(swod_held_groups),
 	ATTR_LIST(swod_hold_cnt),
+	ATTR_LIST(swod_hold_high_cov_cnt),
+	ATTR_LIST(swod_hold_high_frag_cnt),
 	ATTR_LIST(swod_skip_cnt),
 	ATTR_LIST(swod_success_release_cnt),
 	ATTR_LIST(swod_timeout_release_cnt),
@@ -1273,20 +1326,7 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_skip_miss_overlap_cnt),
 	ATTR_LIST(swod_eval_blocked_cnt),
 	ATTR_LIST(swod_eval_no_candidate_cnt),
-	
-	// sfi
-	ATTR_LIST(swod_frag_ipu_enable),
-	ATTR_LIST(swod_frag_ipu_max_pend_blks),
-	ATTR_LIST(swod_frag_ipu_min_cmds),
-	ATTR_LIST(swod_frag_ipu_age_ms),
-	ATTR_LIST(swod_frag_ipu_skip_hot),
 
-	ATTR_LIST(swod_frag_ipu_pick_cnt),
-	ATTR_LIST(swod_frag_ipu_skip_target_cnt),
-	ATTR_LIST(swod_frag_ipu_skip_hot_cnt),
-	ATTR_LIST(swod_frag_ipu_skip_age_cnt),
-	ATTR_LIST(swod_frag_ipu_skip_shape_cnt),
-	
 	// wce
 	ATTR_LIST(swod_completion_enable),
 	ATTR_LIST(swod_gc_bg_enable),
@@ -1294,6 +1334,25 @@ static struct attribute *f2fs_attrs[] = {
 	ATTR_LIST(swod_gc_pick_bg_cnt),
 	ATTR_LIST(swod_gc_pick_fg_cnt),
 	ATTR_LIST(swod_gc_fallback_cnt),
+
+	// V4: 碎片化参数
+	ATTR_LIST(swod_frag_thr_bp),
+	ATTR_LIST(swod_frag_timeout_k),
+	ATTR_LIST(swod_frag_min_cmds),
+	ATTR_LIST(swod_frag_max_avg_piece_blks),
+	ATTR_LIST(swod_frag_min_total_pend),
+
+	// V4: HBU 参数和统计
+	ATTR_LIST(swod_hbu_enable),
+	ATTR_LIST(swod_hbu_valid_thr_bp),
+	ATTR_LIST(swod_hbu_min_cmds),
+	ATTR_LIST(swod_hbu_target_cnt),
+	ATTR_LIST(swod_hbu_target_add_cnt),
+	ATTR_LIST(swod_hbu_target_rm_cnt),
+	ATTR_LIST(swod_hbu_ipu_pick_cnt),
+	ATTR_LIST(swod_hbu_alloc_success_cnt),
+	ATTR_LIST(swod_hbu_alloc_skip_held_cnt),
+	ATTR_LIST(swod_hbu_alloc_skip_full_cnt),
 
 	NULL,
 };

@@ -428,12 +428,17 @@ struct discard_cmd_control {
 	unsigned int swod_gc_bg_enable;        /* 0/1 */
 	unsigned int swod_gc_fg_enable;        /* 0/1 */
 	
-	/* ---------- selective fragment-IPU tunables ---------- */
-	unsigned int swod_frag_ipu_enable;         /* 0/1 */
-	unsigned int swod_frag_ipu_max_pend_blks;  /* tiny fragment upper bound */
-	unsigned int swod_frag_ipu_min_cmds;       /* fragment count lower bound */
-	unsigned int swod_frag_ipu_age_ms;         /* oldest pending age threshold */
-	unsigned int swod_frag_ipu_skip_hot;       /* 0/1 */
+	/* ---------- V4: HBU tunables ---------- */
+	unsigned int swod_frag_min_cmds;           /* min cmds per seg for frag detection */
+	unsigned int swod_frag_max_avg_piece_blks; /* max avg piece size for frag */
+	unsigned int swod_frag_min_total_pend;     /* min total pend_blks for frag window */
+	unsigned int swod_frag_thr_bp;            /* 碎片化阈值 (默认 7000 = 70%) */
+	unsigned int swod_frag_timeout_k;         /* 碎片化超时倍数 (默认 3) */
+
+	/* ---------- V4: HBU tunables ---------- */
+	unsigned int swod_hbu_enable;              /* HBU 总开关 (默认 0) */
+	unsigned int swod_hbu_valid_thr_bp;        /* HBU 有效块阈值 (默认 8000 = 80%) */
+	unsigned int swod_hbu_min_cmds;            /* HBU nr_cmds 阈值 (默认 3) */
 };
 
 /* for the list of fsync inodes, used only during recovery */

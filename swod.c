@@ -1,7 +1,8 @@
 /* fs/f2fs/swod.c */
-#include "swod.h"                                              
-#include "segment.h" 
-#include "node.h" 
+#include "swod.h"
+#include "segment.h"
+#include "node.h"
+
 static inline bool swod_enabled(struct discard_cmd_control *dcc)
 {
 	return dcc && dcc->swod_enable && dcc->swod;
@@ -49,20 +50,16 @@ static inline unsigned int swod_max_hold_len(struct f2fs_sb_info *sbi,
 
 static unsigned int swod_default_win_segs(struct f2fs_sb_info *sbi)
 {
-    struct block_device *bdev;
-    struct request_queue *q;
-    u64 seg_bytes;
+	struct block_device *bdev;
+	struct request_queue *q;
+	u64 seg_bytes;
 	u64 max_bytes;
-	// u64 seg_bytes = SEGMENT_SIZE(sbi);
-	// u64 max_bytes = (u64)bdev_max_discard_sectors(sbi->sb->s_bdev) << 9;
 	unsigned int n;
 
-    if (!sbi || !sbi->sb)
+	if (!sbi || !sbi->sb)
 		return 1;
-	// if (!max_bytes || !seg_bytes)
-	// 	return 1;
 
-    bdev = sbi->sb->s_bdev;
+	bdev = sbi->sb->s_bdev;
 	if (!bdev)
 		return 1;
 
@@ -71,15 +68,10 @@ static unsigned int swod_default_win_segs(struct f2fs_sb_info *sbi)
 		return 1;
 
 	seg_bytes = SEGMENT_SIZE(sbi);
-    /*
-	 * Linux 5.15: 直接使用 queue limits 中的软件 discard 上限
-	 * max_discard_sectors 的单位是 512B sector
-	 */
 	max_bytes = (u64)q->limits.max_discard_sectors << 9;
 
 	if (!max_bytes || !seg_bytes)
 		return 1;
-
 
 	n = div_u64(max_bytes, seg_bytes);
 	if (!n)
@@ -98,39 +90,32 @@ static inline bool swod_regime_blocked(struct f2fs_sb_info *sbi,
 	if (!swod_enabled(dcc))
 		return true;
 
-	/*
-	 * Normal path: SWOD only shapes background discard.
-	 * Urgent path: still allow SWOD, but urgent windows are shrunk
-	 * in swod_eval_group_locked().
-	 */
 	if (dpolicy && dpolicy->type != DPOLICY_BG && !swod_is_urgent(sbi))
 		return true;
 
-	/* stock discard thread already treats this as aggressive regime */
 	if (utilization(sbi) > DEF_DISCARD_URGENT_UTIL)
 		return true;
 
 	if (!f2fs_available_free_memory(sbi, DISCARD_CACHE))
 		return true;
 
-	/*
-	 * Do not block new SWOD candidate evaluation just because backlog is large.
-	 * High discard_cmd_cnt / undiscard_blks is exactly when shaping is useful.
-	 * Existing held ranges are still released by the issue thread when the
-	 * runtime policy switches to a bypass regime.
-	 */
 	return false;
 }
 
+/*
+ * V4: 计算 hold 超时时间
+ * 碎片化窗口的超时时间是普通窗口的 k 倍
+ */
 static unsigned int swod_calc_hold_ms(struct f2fs_sb_info *sbi,
 				      unsigned int run_len,
 				      unsigned int qcov_bp,
-				      unsigned int lres_bp)
+				      unsigned int lres_bp,
+				      bool is_frag)
 {
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	unsigned int hold = dcc->swod_hold_min_ms;
 
-	/* 保守整数启发式：run 越长、qcov 越高、lres 越低，可以多等一点 */
+	/* 保守整数启发式 */
 	if (run_len > 1)
 		hold += (run_len - 1) * 10;
 
@@ -147,42 +132,32 @@ static unsigned int swod_calc_hold_ms(struct f2fs_sb_info *sbi,
 		hold = dcc->swod_hold_min_ms;
 	if (hold > dcc->swod_hold_max_ms)
 		hold = dcc->swod_hold_max_ms;
+
+	/* V4: 碎片化窗口延长超时时间 */
+	if (is_frag) {
+		unsigned int k = dcc->swod_frag_timeout_k ? dcc->swod_frag_timeout_k : 3;
+		hold = hold * k;
+		if (hold > dcc->swod_hold_max_ms * k)
+			hold = dcc->swod_hold_max_ms * k;
+	}
+
 	return hold;
 }
 
 static inline bool swod_group_is_active(const struct swod_group_hint *g)
 {
-	return g->state == SWOD_G_HELD || g->state == SWOD_G_PARKED;
+	return g->state == SWOD_G_HELD;
 }
 
 static inline unsigned long swod_group_deadline(const struct swod_group_hint *g)
 {
-	return g->state == SWOD_G_PARKED ? g->park_until : g->hold_until;
+	return g->hold_until;
 }
 
-static unsigned int swod_calc_park_ms(struct f2fs_sb_info *sbi,
-				      unsigned int run_len,
-				      unsigned int qcov_bp,
-				      unsigned int lres_bp)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	unsigned int park = swod_calc_hold_ms(sbi, run_len, qcov_bp, lres_bp);
-
-	park <<= 2;
-	if (park < dcc->swod_hold_max_ms)
-		park = dcc->swod_hold_max_ms;
-	if (park < SWOD_WCE_PARK_MIN_MS)
-		park = SWOD_WCE_PARK_MIN_MS;
-	if (park > SWOD_WCE_PARK_MAX_MS)
-		park = SWOD_WCE_PARK_MAX_MS;
-	return park;
-}
-
-static inline unsigned int swod_park_budget(struct discard_cmd_control *dcc)
-{
-	return max(4U, dcc->swod_max_held_groups >> 1);
-}
-
+/*
+ * V4: 清除 group 的 held 状态
+ * 同时清除 held_segmap 中对应的 bit
+ */
 static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 				    unsigned int gid)
 {
@@ -190,98 +165,35 @@ static void swod_clear_group_locked(struct f2fs_sb_info *sbi,
 	struct swod_ctrl *sw = dcc->swod;
 	struct swod_group_hint *g = &sw->grp_hint[gid];
 	unsigned int first = swod_group_first_seg(sw, gid);
-	unsigned int nsegs = swod_group_nsegs(sw, gid);
+	unsigned int off = g->hold_off;
+	unsigned int len = g->hold_len;
 	unsigned int i;
 
-	if (g->state == SWOD_G_HELD && sw->nr_held_groups)
-		sw->nr_held_groups--;
-	else if (g->state == SWOD_G_PARKED && sw->nr_parked_groups)
-		sw->nr_parked_groups--;
+	/*
+	 * V4: 先保存 win_type 再清理 group 状态。
+	 * held_segmap 只在 HIGH_COV 窗口设置，清理时需要用旧值判断。
+	 */
+	u8 win_type = g->win_type;
+
+	if (g->state == SWOD_G_HELD && atomic_read(&sw->nr_held_groups) &&
+	    win_type == SWOD_WIN_HIGH_COV)
+		atomic_dec(&sw->nr_held_groups);
 
 	g->state = SWOD_G_NORMAL;
 	g->hold_off = 0;
 	g->hold_len = 0;
 	g->hold_qbp = 0;
 	g->hold_lbp = 0;
-	g->park_score = 0;
 	g->hold_until = 0;
-	g->park_until = 0;
 	g->last_eval = jiffies;
+	g->win_type = SWOD_WIN_NONE;
+	g->frag_score = 0;
 
-	for (i = 0; i < nsegs; i++) {
-		clear_bit(first + i, sw->hold_segmap);
-		clear_bit(first + i, sw->park_segmap);
+	/* V4: 只清理 held window 范围内的 segment（用 hold_off + hold_len） */
+	if (win_type == SWOD_WIN_HIGH_COV && len > 0) {
+		for (i = 0; i < len; i++)
+			clear_bit(first + off + i, sw->held_segmap);
 	}
-}
-
-static bool swod_collect_window_locked(struct f2fs_sb_info *sbi,
-				       unsigned int gid,
-				       unsigned int *qbp,
-				       unsigned int *lbp,
-				       unsigned int *cold_cnt,
-				       unsigned long *oldest)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	struct swod_ctrl *sw = dcc->swod;
-	struct swod_group_hint *g = &sw->grp_hint[gid];
-	unsigned int first = swod_group_first_seg(sw, gid);
-	unsigned int i, q = 0, l = 0, cold = 0;
-	unsigned long oldest_j = 0;
-	u64 cap;
-
-	if (!swod_group_is_active(g) || !g->hold_len)
-		return false;
-
-	for (i = 0; i < g->hold_len; i++) {
-		unsigned int segno = first + g->hold_off + i;
-		struct seg_entry *se;
-
-		if (segno >= sw->nr_main_segs)
-			return false;
-
-		q += sw->seg_hint[segno].pend_blks;
-		l += get_valid_blocks(sbi, segno, false);
-		if (sw->seg_hint[segno].oldest_jiffies &&
-		    (!oldest_j ||
-		     time_before(sw->seg_hint[segno].oldest_jiffies, oldest_j)))
-			oldest_j = sw->seg_hint[segno].oldest_jiffies;
-
-		se = get_seg_entry(sbi, segno);
-		if (IS_COLD(se->type))
-			cold++;
-	}
-
-	cap = (u64)g->hold_len * sbi->blocks_per_seg;
-	if (!cap)
-		return false;
-
-	if (qbp)
-		*qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
-	if (lbp)
-		*lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
-	if (cold_cnt)
-		*cold_cnt = cold;
-	if (oldest)
-		*oldest = oldest_j;
-	return true;
-}
-
-static unsigned int swod_calc_park_score(unsigned int len,
-					 unsigned int qbp,
-					 unsigned int lbp,
-					 unsigned int cold_cnt,
-					 unsigned long oldest,
-					 unsigned long now)
-{
-	unsigned long age_ms = 0;
-
-	if (oldest && !time_after(oldest, now))
-		age_ms = jiffies_to_msecs(now - oldest);
-	if (age_ms > 1000)
-		age_ms = 1000;
-
-	return cold_cnt * 100000U + len * 10000U + qbp * 2U +
-	       (SWOD_BP_ONE - min(lbp, SWOD_BP_ONE)) + age_ms;
 }
 
 static void swod_account_release(struct swod_ctrl *sw,
@@ -315,82 +227,10 @@ static void swod_drop_group_locked(struct f2fs_sb_info *sbi,
 	swod_clear_group_locked(sbi, gid);
 }
 
-static bool swod_try_park_group_locked(struct f2fs_sb_info *sbi,
-				       unsigned int gid,
-				       enum swod_release_reason why,
-				       unsigned long now)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	struct swod_ctrl *sw = dcc->swod;
-	struct swod_group_hint *g = &sw->grp_hint[gid];
-	unsigned int qbp, lbp, cold_cnt, limit, budget;
-	unsigned long oldest;
-	unsigned int score, i;
-	unsigned int victim_gid = UINT_MAX;
-	struct swod_group_hint *victim = NULL;
-	unsigned int first;
-
-	if (!sw || g->state != SWOD_G_HELD)
-		return false;
-	if (why != SWOD_REL_TIMEOUT && why != SWOD_REL_PRESSURE)
-		return false;
-	if (!swod_collect_window_locked(sbi, gid, &qbp, &lbp,
-					&cold_cnt, &oldest))
-		return false;
-
-	/* still needs pending holes, but should already be easy to clean */
-	if (qbp < dcc->swod_qcov_thr_bp)
-		return false;
-	limit = min_t(unsigned int, SWOD_WCE_PARK_LRES_CAP_BP,
-		      dcc->swod_lres_thr_bp + 1000);
-	if (!lbp || lbp > limit)
-		return false;
-
-	score = swod_calc_park_score(g->hold_len, qbp, lbp,
-				    cold_cnt, oldest, now);
-	budget = swod_park_budget(dcc);
-	if (sw->nr_parked_groups >= budget) {
-		for (i = 0; i < sw->nr_groups; i++) {
-			struct swod_group_hint *cand = &sw->grp_hint[i];
-
-			if (cand->state != SWOD_G_PARKED)
-				continue;
-			if (!victim || cand->park_score < victim->park_score) {
-				victim_gid = i;
-				victim = cand;
-			}
-		}
-		if (!victim || score <= victim->park_score)
-			return false;
-		swod_drop_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
-	}
-
-	first = swod_group_first_seg(sw, gid);
-	if (sw->nr_held_groups)
-		sw->nr_held_groups--;
-	for (i = 0; i < g->hold_len; i++) {
-		clear_bit(first + g->hold_off + i, sw->hold_segmap);
-		set_bit(first + g->hold_off + i, sw->park_segmap);
-	}
-
-	g->state = SWOD_G_PARKED;
-	g->hold_qbp = qbp;
-	g->hold_lbp = lbp;
-	g->park_score = score;
-	g->hold_until = 0;
-	g->park_until = now + msecs_to_jiffies(
-		swod_calc_park_ms(sbi, g->hold_len, qbp, lbp));
-	g->last_eval = now;
-	sw->nr_parked_groups++;
-	return true;
-}
-
 static void swod_release_group_locked(struct f2fs_sb_info *sbi,
 				      unsigned int gid,
 				      enum swod_release_reason why)
 {
-	if (swod_try_park_group_locked(sbi, gid, why, jiffies))
-		return;
 	swod_drop_group_locked(sbi, gid, why);
 }
 
@@ -502,6 +342,80 @@ static void swod_rebuild_groups_locked(struct f2fs_sb_info *sbi,
 	}
 }
 
+/*
+ * V4: 评估 group 内每个 segment 是否应该加入 hbu_targets
+ * HBU 条件：高有效块 (>= 80%) + 高碎片化 (nr_cmds >= 3) + 不在 held_segmap 中
+ */
+static void swod_eval_segments_for_hbu_locked(struct f2fs_sb_info *sbi,
+					       unsigned int gid0,
+					       unsigned int gid1)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw = dcc->swod;
+	unsigned int gid;
+	unsigned int hbu_valid_thr = dcc->swod_hbu_valid_thr_bp;
+	unsigned int hbu_min_cmds = dcc->swod_hbu_min_cmds;
+
+	if (!sw || !hbu_valid_thr)
+		return;
+
+	/* 如果没有设置阈值，使用默认值 80% */
+	if (!hbu_valid_thr)
+		hbu_valid_thr = 8000;
+	if (!hbu_min_cmds)
+		hbu_min_cmds = 3;
+
+	/* 遍历 gid 范围内的每个 segment */
+	for (gid = gid0; gid <= gid1; gid++) {
+		unsigned int first = swod_group_first_seg(sw, gid);
+		unsigned int n = swod_group_nsegs(sw, gid);
+		unsigned int i;
+
+		for (i = 0; i < n; i++) {
+			unsigned int segno = first + i;
+			unsigned int valid_blks, total_blks;
+			unsigned int valid_bp;
+			struct swod_seg_hint *hint;
+
+			if (segno >= sw->nr_main_segs)
+				break;
+
+			hint = &sw->seg_hint[segno];
+
+			/* 检查是否在 held_segmap 中（冲突检测） */
+			if (test_bit(segno, sw->held_segmap))
+				goto remove_hbu;
+
+			/* 获取有效块信息 */
+			valid_blks = get_valid_blocks(sbi, segno, false);
+			total_blks = sbi->blocks_per_seg;
+			valid_bp = (unsigned int)div_u64((u64)valid_blks * SWOD_BP_ONE,
+							  total_blks);
+
+			/* 检查 HBU 条件：高有效块 + 高碎片化 */
+			if (valid_bp >= hbu_valid_thr &&
+			    hint->nr_cmds >= hbu_min_cmds) {
+				/* 加入 hbu_targets */
+				if (!test_and_set_bit(segno, sw->hbu_segmap)) {
+					atomic_inc(&sw->nr_hbu_segs);
+					atomic64_inc(&sw->hbu_target_add_cnt);
+				}
+				continue;
+			}
+
+remove_hbu:
+			/* 从 hbu_targets 移除 */
+			if (test_and_clear_bit(segno, sw->hbu_segmap)) {
+				atomic_dec(&sw->nr_hbu_segs);
+				atomic64_inc(&sw->hbu_target_rm_cnt);
+			}
+		}
+	}
+}
+
+/*
+ * V4: group 评估 - 决定是否 hold 整个 group/window
+ */
 static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 				   unsigned int gid,
 				   unsigned long now)
@@ -514,10 +428,15 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 	unsigned int qpref[SWOD_MAX_WIN_SEGS + 1] = {0};
 	unsigned int lpref[SWOD_MAX_WIN_SEGS + 1] = {0};
 	unsigned long oldest_seg[SWOD_MAX_WIN_SEGS] = {0};
-	bool found = false;
+
+	/* 最佳候选 */
+	bool found_candidate = false;
 	unsigned int best_off = 0, best_len = 0;
 	unsigned int best_qbp = 0, best_lbp = UINT_MAX;
 	unsigned long best_oldest = 0;
+	bool is_frag = false;
+	unsigned int best_frag_score = 0;
+
 	unsigned int max_len = swod_max_hold_len(sbi, sw, gid);
 	unsigned int i, off, len, max_this_len;
 
@@ -547,12 +466,19 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 		return;
 	}
 
+	/* 构建 prefix sum 用于快速窗口评估 */
 	for (i = 0; i < n; i++) {
 		qpref[i + 1] = qpref[i] + sw->seg_hint[first + i].pend_blks;
 		lpref[i + 1] = lpref[i] + get_valid_blocks(sbi, first + i, false);
 		oldest_seg[i] = sw->seg_hint[first + i].oldest_jiffies;
 	}
 
+	/*
+	 * V4: 遍历所有候选窗口
+	 * 对于每个窗口，先判断是否普通窗口（qcov 高 && lres 低）
+	 * 如果是，直接作为候选
+	 * 如果不是，再判断是否碎片窗口
+	 */
 	for (off = 0; off < n; off++) {
 		unsigned long cur_oldest = 0;
 
@@ -562,6 +488,7 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 			unsigned int endi = off + len - 1;
 			unsigned int q, l;
 
+			/* 找窗口中最老的时间戳 */
 			if (oldest_seg[endi] &&
 			    (!cur_oldest ||
 			     time_before(oldest_seg[endi], cur_oldest)))
@@ -571,48 +498,105 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 			l = lpref[off + len] - lpref[off];
 			cap = (u64)len * sbi->blocks_per_seg;
 
-			qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
-			lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
-
 			/* already fully ready: let stock issue it, do not hold */
 			if (q == cap)
 				continue;
 
-			if (qbp < dcc->swod_qcov_thr_bp)
-				continue;
-			if (lbp > dcc->swod_lres_thr_bp)
+			qbp = div_u64((u64)q * SWOD_BP_ONE, cap);
+			lbp = div_u64((u64)l * SWOD_BP_ONE, cap);
+
+			/* ========== Path A: 普通窗口（qcov 高 && lres 低） ========== */
+			if (qbp >= dcc->swod_qcov_thr_bp &&
+			    lbp <= dcc->swod_lres_thr_bp) {
+				if (!found_candidate ||
+				    len > best_len ||
+				    (len == best_len && lbp < best_lbp) ||
+				    (len == best_len && lbp == best_lbp &&
+				     (!best_oldest || time_before(cur_oldest, best_oldest)))) {
+					found_candidate = true;
+					best_off = off;
+					best_len = len;
+					best_qbp = qbp;
+					best_lbp = lbp;
+					best_oldest = cur_oldest;
+					is_frag = false;
+				}
+				break;
+			}
+
+			/* ========== Path B: 碎片窗口 ========== */
+			if (q == 0)
 				continue;
 
-			if (!found ||
-			    len > best_len ||
-			    (len == best_len && lbp < best_lbp) ||
-			    (len == best_len && lbp == best_lbp &&
-			     (!best_oldest || time_before(cur_oldest, best_oldest)))) {
-				found = true;
-				best_off = off;
-				best_len = len;
-				best_qbp = qbp;
-				best_lbp = lbp;
-				best_oldest = cur_oldest;
+			{
+				unsigned int seg_pend = 0, seg_cmds = 0;
+				unsigned int avg_piece;
+				unsigned int curr_frag_score;
+				bool all_segs_frag = true;
+
+				for (i = 0; i < len; i++) {
+					unsigned int segno = first + off + i;
+					struct swod_seg_hint *h = &sw->seg_hint[segno];
+
+					seg_pend += h->pend_blks;
+					seg_cmds += h->nr_cmds;
+
+					if (h->nr_cmds < dcc->swod_frag_min_cmds ||
+					    h->pend_blks == 0) {
+						all_segs_frag = false;
+						break;
+					}
+				}
+
+				if (!all_segs_frag)
+					continue;
+
+				avg_piece = div_u64(seg_pend, seg_cmds);
+
+				if (avg_piece > dcc->swod_frag_max_avg_piece_blks)
+					continue;
+				if (seg_pend < dcc->swod_frag_min_total_pend)
+					continue;
+
+				/* 碎片化分数 */
+				curr_frag_score = (seg_cmds * 1000) / (avg_piece + 1);
+
+				if (!found_candidate ||
+				    curr_frag_score > best_frag_score ||
+				    (curr_frag_score == best_frag_score &&
+				     (!best_oldest || time_before(cur_oldest, best_oldest)))) {
+					found_candidate = true;
+					best_off = off;
+					best_len = len;
+					best_qbp = 0;
+					best_lbp = 0;
+					best_oldest = cur_oldest;
+					is_frag = true;
+					best_frag_score = curr_frag_score;
+				}
 			}
 		}
 	}
 
-	if (!found) {
+	/* 没找到候选 */
+	if (!found_candidate) {
 		atomic64_inc(&sw->eval_no_candidate_cnt);
 		return;
 	}
 
-	if (sw->nr_held_groups >= dcc->swod_max_held_groups) {
+	/* V4: 检查是否需要替换已有 held 窗口 */
+	if (atomic_read(&sw->nr_held_groups) >= dcc->swod_max_held_groups) {
 		unsigned int victim_gid = UINT_MAX;
 		struct swod_group_hint *victim = NULL;
 
+		/* 找最差的 held 窗口 */
 		for (i = 0; i < sw->nr_groups; i++) {
 			struct swod_group_hint *cand = &sw->grp_hint[i];
 
 			if (cand->state != SWOD_G_HELD)
 				continue;
-			if (!victim || cand->hold_qbp < victim->hold_qbp ||
+			if (!victim ||
+			    cand->hold_qbp < victim->hold_qbp ||
 			    (cand->hold_qbp == victim->hold_qbp &&
 			     cand->hold_lbp > victim->hold_lbp) ||
 			    (cand->hold_qbp == victim->hold_qbp &&
@@ -623,37 +607,66 @@ static void swod_eval_group_locked(struct f2fs_sb_info *sbi,
 			}
 		}
 
-		if (!victim)
-			return;
-		if (best_qbp < victim->hold_qbp)
-			return;
-		if (best_qbp == victim->hold_qbp && best_lbp > victim->hold_lbp)
-			return;
-		if (best_qbp == victim->hold_qbp && best_lbp == victim->hold_lbp &&
-		    best_len <= victim->hold_len)
-			return;
+		if (victim) {
+			bool do_replace = false;
 
-		swod_release_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
+			/*
+			 * V4: 替换策略（与 V3 一致）：
+			 * - 普通窗口：只能替换普通窗口，且新普通的 qbp 要高于旧的
+			 * - 碎片窗口：可以替换任意窗口（普通或碎片）
+			 *   - 替换碎片窗口时，必须新的更碎
+			 */
+			if (is_frag) {
+				if (victim->win_type == SWOD_WIN_HIGH_FRAG) {
+					if (best_frag_score > victim->frag_score)
+						do_replace = true;
+				} else {
+					do_replace = true;
+				}
+			} else {
+				if (victim->win_type == SWOD_WIN_HIGH_COV &&
+				    best_qbp > victim->hold_qbp)
+					do_replace = true;
+			}
+
+			if (do_replace)
+				swod_release_group_locked(sbi, victim_gid, SWOD_REL_PRESSURE);
+			else
+				return;
+		} else {
+			return;
+		}
 	}
 
+	/* V4: 安装候选窗口 */
 	g->state = SWOD_G_HELD;
 	g->hold_off = best_off;
 	g->hold_len = best_len;
 	g->hold_qbp = best_qbp;
 	g->hold_lbp = best_lbp;
-	g->park_score = 0;
 	g->hold_until = now + msecs_to_jiffies(
-		swod_calc_hold_ms(sbi, best_len, best_qbp, best_lbp));
-	g->park_until = 0;
+		swod_calc_hold_ms(sbi, best_len, best_qbp, best_lbp, is_frag));
 	g->last_eval = now;
-	sw->nr_held_groups++;
+	g->win_type = is_frag ? SWOD_WIN_HIGH_FRAG : SWOD_WIN_HIGH_COV;
+	g->frag_score = is_frag ? best_frag_score : 0;
 
-	for (i = 0; i < best_len; i++) {
-		set_bit(first + best_off + i, sw->hold_segmap);
-		clear_bit(first + best_off + i, sw->park_segmap);
+	/* V4: 只有高 qcov 窗口才设置 held_segmap（给 WCE 用），高碎片化不设置 */
+	if (!is_frag) {
+		atomic_inc(&sw->nr_held_groups);
+		for (i = 0; i < best_len; i++) {
+			unsigned int segno = first + best_off + i;
+			set_bit(segno, sw->held_segmap);
+			/* 同步从 hbu_segmap 移除，保证互斥性 */
+			if (test_and_clear_bit(segno, sw->hbu_segmap))
+				atomic_dec(&sw->nr_hbu_segs);
+		}
 	}
 
 	atomic64_inc(&sw->hold_cnt);
+	if (is_frag)
+		atomic64_inc(&sw->hold_high_frag_cnt);
+	else
+		atomic64_inc(&sw->hold_high_cov_cnt);
 }
 
 int f2fs_swod_init(struct f2fs_sb_info *sbi)
@@ -690,11 +703,32 @@ int f2fs_swod_init(struct f2fs_sb_info *sbi)
 	if (!dcc->swod_blk_pressure)
 		dcc->swod_blk_pressure = 1 << 20;
 	if (!dcc->swod_max_held_groups)
-		dcc->swod_max_held_groups = 64;
+		dcc->swod_max_held_groups = 128;
+
+	/* 碎片化窗口检测参数 */
+	if (!dcc->swod_frag_min_cmds)
+		dcc->swod_frag_min_cmds = 3;
+	if (!dcc->swod_frag_max_avg_piece_blks)
+		dcc->swod_frag_max_avg_piece_blks = 16; /* avg piece <= 16 才算碎片 */
+	if (!dcc->swod_frag_min_total_pend)
+		dcc->swod_frag_min_total_pend = 64;
+	if (!dcc->swod_frag_thr_bp)
+		dcc->swod_frag_thr_bp = 7000;
+	if (!dcc->swod_frag_timeout_k)
+		dcc->swod_frag_timeout_k = 3;
+
+	/* V4: HBU 参数初始化 */
+	if (!dcc->swod_hbu_valid_thr_bp)
+		dcc->swod_hbu_valid_thr_bp = 8000;  /* 80% */
+	if (!dcc->swod_hbu_min_cmds)
+		dcc->swod_hbu_min_cmds = 4;
 
 	sw->nr_main_segs = MAIN_SEGS(sbi);
 	sw->win_segs = dcc->swod_win_segs;
 	sw->nr_groups = DIV_ROUND_UP(sw->nr_main_segs, sw->win_segs);
+
+	/* 初始化周期性扫描进度 */
+	sw->scan_progress = 0;
 
 	seg_hint_sz = array_size(sw->nr_main_segs, sizeof(*sw->seg_hint));
 	grp_hint_sz = array_size(sw->nr_groups, sizeof(*sw->grp_hint));
@@ -702,17 +736,20 @@ int f2fs_swod_init(struct f2fs_sb_info *sbi)
 
 	sw->seg_hint = f2fs_kvzalloc(sbi, seg_hint_sz, GFP_KERNEL);
 	sw->grp_hint = f2fs_kvzalloc(sbi, grp_hint_sz, GFP_KERNEL);
-	sw->hold_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
-	sw->park_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
-	if (!sw->seg_hint || !sw->grp_hint || !sw->hold_segmap ||
-	    !sw->park_segmap) {
+	sw->held_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	sw->hbu_segmap = f2fs_kvzalloc(sbi, bm_sz, GFP_KERNEL);
+	if (!sw->seg_hint || !sw->grp_hint || !sw->held_segmap || !sw->hbu_segmap) {
 		kvfree(sw->seg_hint);
 		kvfree(sw->grp_hint);
-		kvfree(sw->hold_segmap);
-		kvfree(sw->park_segmap);
+		kvfree(sw->held_segmap);
+		kvfree(sw->hbu_segmap);
 		kfree(sw);
 		return -ENOMEM;
 	}
+
+	/* V4: 初始化 HBU 计数 */
+	atomic_set(&sw->nr_hbu_segs, 0);
+	atomic_set(&sw->nr_held_groups, 0);
 
 	dcc->swod = sw;
 	return 0;
@@ -729,8 +766,8 @@ void f2fs_swod_destroy(struct f2fs_sb_info *sbi)
 	sw = dcc->swod;
 	kvfree(sw->seg_hint);
 	kvfree(sw->grp_hint);
-	kvfree(sw->hold_segmap);
-	kvfree(sw->park_segmap);
+	kvfree(sw->held_segmap);
+	kvfree(sw->hbu_segmap);
 	kfree(sw);
 	dcc->swod = NULL;
 }
@@ -761,6 +798,9 @@ void f2fs_swod_refresh_around_locked(struct f2fs_sb_info *sbi,
 
 	for (g = gid0; g <= gid1; g++)
 		swod_eval_group_locked(sbi, g, now);
+
+	/* V4: 评估 segment 是否应该加入 hbu_targets */
+	swod_eval_segments_for_hbu_locked(sbi, gid0, gid1);
 }
 
 bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
@@ -809,10 +849,6 @@ bool f2fs_swod_should_skip_locked(struct f2fs_sb_info *sbi,
 		held_first = swod_group_first_seg(sw, gid) + g->hold_off;
 		held_last  = held_first + g->hold_len - 1;
 
-		/*
-		 * Hold any cmd overlapping an active sub-window.
-		 * This covers cross-group cmds and partial overlaps too.
-		 */
 		if (seg1 < held_first || seg0 > held_last) {
 			atomic64_inc(&sw->skip_miss_overlap_cnt);
 			continue;
@@ -878,24 +914,40 @@ void f2fs_swod_sweep_timeout(struct f2fs_sb_info *sbi, unsigned long now)
 	mutex_unlock(&dcc->cmd_lock);
 }
 
-// bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
-// {
-// 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+/*
+ * V4: 周期性后台评估
+ */
+void f2fs_swod_periodic_scan(struct f2fs_sb_info *sbi, unsigned long now)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int gid, end;
+	unsigned int processed = 0;
 
-// 	if (!swod_enabled(dcc))
-// 		return false;
-// 	if (segno >= dcc->swod->nr_main_segs)
-// 		return false;
+	if (!swod_enabled(dcc))
+		return;
 
-// 	return test_bit(segno, dcc->swod->hold_segmap);
-// }
+	sw = dcc->swod;
 
+#define SWOD_SCAN_BATCH_SIZE  16
 
+	gid = sw->scan_progress;
+	end = min(sw->scan_progress + SWOD_SCAN_BATCH_SIZE, sw->nr_groups);
+
+	for (; gid < end && processed < SWOD_SCAN_BATCH_SIZE; gid++, processed++) {
+		swod_eval_group_locked(sbi, gid, now);
+		/* V4: 周期性扫描也评估 HBU */
+		swod_eval_segments_for_hbu_locked(sbi, gid, gid);
+	}
+
+	if (gid >= sw->nr_groups)
+		sw->scan_progress = 0;
+	else
+		sw->scan_progress = gid;
+}
 
 /*
- * GC-side WCE lookup is advisory only, so lockless bitmap reads are enough.
- * Races only change the bias of victim selection and will fall back to the
- * stock picker when no target survives the normal GC checks.
+ * WCE 查询接口
  */
 bool f2fs_swod_has_held(struct f2fs_sb_info *sbi)
 {
@@ -904,7 +956,7 @@ bool f2fs_swod_has_held(struct f2fs_sb_info *sbi)
 	if (!swod_enabled(dcc))
 		return false;
 
-	return !!READ_ONCE(dcc->swod->nr_held_groups);
+	return atomic_read(&dcc->swod->nr_held_groups) > 0;
 }
 
 bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
@@ -920,50 +972,12 @@ bool f2fs_swod_range_held(struct f2fs_sb_info *sbi, unsigned int segno,
 	sw = dcc->swod;
 	if (!nr_segs || segno >= sw->nr_main_segs)
 		return false;
-	if (!READ_ONCE(sw->nr_held_groups))
+	if (atomic_read(&sw->nr_held_groups) == 0)
 		return false;
 
 	end = min(sw->nr_main_segs, segno + nr_segs);
 	for (; segno < end; segno++) {
-		if (test_bit(segno, sw->hold_segmap))
-			return true;
-	}
-
-	return false;
-}
-
-bool f2fs_swod_has_wce_target(struct f2fs_sb_info *sbi)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	struct swod_ctrl *sw;
-
-	if (!swod_enabled(dcc))
-		return false;
-
-	sw = dcc->swod;
-	return !!READ_ONCE(sw->nr_held_groups) || !!READ_ONCE(sw->nr_parked_groups);
-}
-
-bool f2fs_swod_range_wce_target(struct f2fs_sb_info *sbi, unsigned int segno,
-				unsigned int nr_segs)
-{
-	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
-	struct swod_ctrl *sw;
-	unsigned int end;
-
-	if (!swod_enabled(dcc))
-		return false;
-
-	sw = dcc->swod;
-	if (!nr_segs || segno >= sw->nr_main_segs)
-		return false;
-	if (!READ_ONCE(sw->nr_held_groups) && !READ_ONCE(sw->nr_parked_groups))
-		return false;
-
-	end = min(sw->nr_main_segs, segno + nr_segs);
-	for (; segno < end; segno++) {
-		if (test_bit(segno, sw->hold_segmap) ||
-		    test_bit(segno, sw->park_segmap))
+		if (test_bit(segno, sw->held_segmap))
 			return true;
 	}
 
@@ -976,88 +990,162 @@ bool f2fs_swod_seg_held(struct f2fs_sb_info *sbi, unsigned int segno)
 }
 
 /*
- * Advisory-only selector for a very narrow LFS-side fragment IPU exception.
- * It is only used while SWOD currently has held windows, and never for
- * segments that belong to a held target window.
-    不决定 IPU/OPU；
-    只判断“这个 old block 对应的 seg 是否是一个老、小、碎、非 target、非热的 fragment 候选”
-*/
-bool f2fs_swod_should_frag_ipu(struct inode *inode,
-			       struct f2fs_io_info *fio)
+ * V4: WCE 从 held_segmap 中找 dirty segment
+ * 遍历 held_segmap（SWOD 评估后的 bitmap），找到第一个 dirty segment
+ * 返回 segno，0 表示没找到
+ */
+unsigned int f2fs_swod_pick_held_dirty(struct f2fs_sb_info *sbi,
+				      unsigned long *dirty_bitmap,
+				      unsigned int max_segno)
 {
-	struct f2fs_sb_info *sbi = fio->sbi;
 	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
 	struct swod_ctrl *sw;
-	unsigned int segno, pend_blks, nr_cmds, age_thr;
-	unsigned long oldest, age_ms;
+	unsigned int segno;
 
-	if (!dcc || !swod_enabled(dcc) || !dcc->swod_frag_ipu_enable)
-		return false;
-	if (!f2fs_lfs_mode(sbi))
-		return false;
-	if (!fio || !__is_valid_data_blkaddr(fio->old_blkaddr))
-		return false;
+	if (!swod_enabled(dcc) || !dcc->swod)
+		return 0;
 
-	/*
-	 * SFI 是 WCE 的辅助路径，只在系统当前真的有 held windows 时启用。
-	 */
-	if (!f2fs_swod_has_held(sbi))
+	sw = dcc->swod;
+	if (atomic_read(&sw->nr_held_groups) == 0)
+		return 0;
+
+	/* 遍历 held_segmap，只检查 held=1 的 segment */
+	for_each_set_bit(segno, sw->held_segmap, max_segno) {
+		/* 检查是否是 dirty segment */
+		if (test_bit(segno, dirty_bitmap))
+			return segno;
+	}
+
+	return 0;
+}
+
+/*
+ * V4: HBU 查询接口
+ * 检查 segment 是否在 hbu_targets 中
+ */
+bool f2fs_swod_seg_in_hbu(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+
+	if (!swod_enabled(dcc))
 		return false;
 
 	sw = dcc->swod;
-	segno = GET_SEGNO(sbi, fio->old_blkaddr);
 	if (segno >= sw->nr_main_segs)
 		return false;
 
+	return test_bit(segno, sw->hbu_segmap);
+}
+
+/*
+ * V4: HBU OPU 分配入口
+ * 从 hbu_targets 中分配一个 segment，返回 segno，NULL_SEGNO 表示失败
+ * 调用者已持有 sit_i->sentry_lock，不需要额外加锁
+ */
+unsigned int f2fs_swod_hbu_alloc(struct f2fs_sb_info *sbi, int type)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int segno;
+
+	if (!swod_enabled(dcc) || !dcc->swod)
+		return NULL_SEGNO;
+
+	/* HBU 总开关未打开 */
+	if (!dcc->swod_hbu_enable)
+		return NULL_SEGNO;
+
+	sw = dcc->swod;
+
+	/* 计数：HBU 尝试分配 */
+	atomic64_inc(&sw->hbu_ipu_pick_cnt);
+
+	/* 遍历 hbu_segmap，找一个可用的 segment */
+	for_each_set_bit(segno, sw->hbu_segmap, sw->nr_main_segs) {
+		/* 检查是否在 held_segmap 中（冲突检测） */
+		if (test_bit(segno, sw->held_segmap)) {
+			atomic64_inc(&sw->hbu_alloc_skip_held_cnt);
+			continue;
+		}
+
+		/* 检查 segment 是否还有空闲无效块空间 */
+		if (!f2fs_segment_has_free_slot(sbi, segno)) {
+			/* segment 已满，从 hbu_targets 移除 */
+			clear_bit(segno, sw->hbu_segmap);
+			atomic_dec(&sw->nr_hbu_segs);
+			atomic64_inc(&sw->hbu_alloc_skip_full_cnt);
+			atomic64_inc(&sw->hbu_target_rm_cnt);
+			continue;
+		}
+
+		/* 找到可用 segment */
+		atomic64_inc(&sw->hbu_alloc_success_cnt);
+		return segno;
+	}
+
+	return NULL_SEGNO;
+}
+
+/*
+ * V4: WCE 选中 held segment 后调用
+ * 清除 held 标记
+ * 注意：GC 路径可能与 discard 路径并发，添加自旋锁保护
+ */
+void f2fs_swod_notify_gc_done(struct f2fs_sb_info *sbi, unsigned int segno)
+{
+	struct discard_cmd_control *dcc = SM_I(sbi)->dcc_info;
+	struct swod_ctrl *sw;
+	unsigned int gid;
+	u8 win_type;
+
+	if (!dcc || !dcc->swod)
+		return;
+
+	sw = dcc->swod;
+
+	/* 检查是否在 held_segmap 中 */
+	if (!test_bit(segno, sw->held_segmap))
+		return;
+
+	gid = swod_gid(sw, segno);
+
 	/*
-	 * target window 绝不走这个辅助 IPU，避免和 WCE completion 打架。
+	 * V4: 先保存 win_type 再清理 group 状态。
+	 * held_segmap 只在 HIGH_COV 窗口设置，清理时需要用旧值判断。
 	 */
-	if (f2fs_swod_seg_held(sbi, segno)) {
-		atomic64_inc(&sw->frag_ipu_skip_target_cnt);
-		return false;
-	}
+	win_type = sw->grp_hint[gid].win_type;
 
 	/*
-	 * 热数据直接跳过；温/冷数据更适合这条路径。
+	 * 只要有一个 held segment 被 GC，整个 held window 的上下文就破坏了。
+	 * 立即清理整个 window 并减少 nr_held_groups。
+	 * 只有高覆盖率窗口才设置 held_segmap，所以只有这类窗口才会走到这里。
 	 */
-	if (dcc->swod_frag_ipu_skip_hot &&
-	    (file_is_hot(inode) || is_inode_flag_set(inode, FI_HOT_DATA))) {
-		atomic64_inc(&sw->frag_ipu_skip_hot_cnt);
-		return false;
+	if (atomic_read(&sw->nr_held_groups) > 0 && win_type == SWOD_WIN_HIGH_COV)
+		atomic_dec(&sw->nr_held_groups);
+
+	/* V4: 只清理 held window 范围内的 segment（用 hold_off + hold_len） */
+	if (win_type == SWOD_WIN_HIGH_COV) {
+		unsigned int first = swod_group_first_seg(sw, gid);
+		unsigned int off = sw->grp_hint[gid].hold_off;
+		unsigned int len = sw->grp_hint[gid].hold_len;
+		unsigned int i;
+
+		for (i = 0; i < len; i++)
+			clear_bit(first + off + i, sw->held_segmap);
 	}
 
-	/*
-	 * advisory bias only; lockless snapshot of seg_hint is sufficient.
-	 */
-	pend_blks = READ_ONCE(sw->seg_hint[segno].pend_blks);
-	nr_cmds = READ_ONCE(sw->seg_hint[segno].nr_cmds);
-	if (!pend_blks ||
-	    pend_blks > dcc->swod_frag_ipu_max_pend_blks ||
-	    nr_cmds < dcc->swod_frag_ipu_min_cmds) {
-		atomic64_inc(&sw->frag_ipu_skip_shape_cnt);
-		return false;
-	}
+	/* 清理 group 状态（与 swod_clear_group_locked 对齐） */
+	sw->grp_hint[gid].state = SWOD_G_NORMAL;
+	sw->grp_hint[gid].hold_off = 0;
+	sw->grp_hint[gid].hold_len = 0;
+	sw->grp_hint[gid].hold_qbp = 0;
+	sw->grp_hint[gid].hold_lbp = 0;
+	sw->grp_hint[gid].hold_until = 0;
+	sw->grp_hint[gid].win_type = SWOD_WIN_NONE;
+	sw->grp_hint[gid].frag_score = 0;
 
-	oldest = READ_ONCE(sw->seg_hint[segno].oldest_jiffies);
-	if (!oldest || time_after(oldest, jiffies)) {
-		atomic64_inc(&sw->frag_ipu_skip_age_cnt);
-		return false;
-	}
-
-	age_ms = jiffies_to_msecs(jiffies - oldest);
-
-	/*
-	 * 冷数据更容易放行；非冷数据要更老才值得这次 IPU。
-	 */
-	age_thr = dcc->swod_frag_ipu_age_ms;
-	if (!file_is_cold(inode))
-		age_thr <<= 1;
-
-	if (age_ms < age_thr) {
-		atomic64_inc(&sw->frag_ipu_skip_age_cnt);
-		return false;
-	}
-
-	atomic64_inc(&sw->frag_ipu_pick_cnt);
-	return true;
+	/* V4: GC 后清理 hbu_segmap（segment 变空，不再是 HBU 目标） */
+	if (test_and_clear_bit(segno, sw->hbu_segmap))
+		atomic_dec(&sw->nr_hbu_segs);
 }

@@ -2667,42 +2667,6 @@ static inline bool need_inplace_update(struct f2fs_io_info *fio)
 }
 
 
-static inline bool swod_allow_frag_ipu(struct inode *inode,
-				       struct f2fs_io_info *fio)
-{
-	struct f2fs_sb_info *sbi = fio->sbi;
-
-	if (!f2fs_lfs_mode(sbi))
-		return false;
-
-	/*
-	 * 保留 stock 的硬 OPU / 特殊语义：
-	 * 这里只覆盖“LFS 默认 OPU”这一条，不去覆盖其他现有约束。
-	 */
-	if (f2fs_is_pinned_file(inode))
-		return false;
-	if (is_sbi_flag_set(sbi, SBI_NEED_FSCK))
-		return false;
-	if (S_ISDIR(inode->i_mode))
-		return false;
-	if (IS_NOQUOTA(inode))
-		return false;
-	if (f2fs_is_atomic_file(inode))
-		return false;
-	if (is_inode_flag_set(inode, FI_ALIGNED_WRITE))
-		return false;
-	if (is_inode_flag_set(inode, FI_OPU_WRITE))
-		return false;
-	if (page_private_gcing(fio->page))
-		return false;
-	if (page_private_dummy(fio->page))
-		return false;
-	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED) &&
-		     f2fs_is_checkpointed_data(sbi, fio->old_blkaddr)))
-		return false;
-
-	return f2fs_swod_should_frag_ipu(inode, fio);
-}
 int f2fs_do_write_data_page(struct f2fs_io_info *fio)
 {
 	struct page *page = fio->page;
@@ -2750,16 +2714,6 @@ got_it:
 		err = -EFSCORRUPTED;
 		goto out_writepage;
 	}
-
-	/*
-	 * LFS 仍然是 OPU-first。
-	 * 这里只给“老、小、碎、非目标、非热”的 pending-discard fragment
-	 * 一个非常窄的辅助 IPU 例外，用来减少 tiny discard 的继续增殖。
-	 */
-	if (!ipu_force &&
-	    __is_valid_data_blkaddr(fio->old_blkaddr) &&
-	    swod_allow_frag_ipu(inode, fio))
-		ipu_force = true;
 
 	/*
 	 * If current allocation needs SSR,
