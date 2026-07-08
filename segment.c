@@ -1889,6 +1889,9 @@ static int issue_discard_thread(void *data)
 	unsigned long now;
 	int issued;
 
+	// for delay
+	// unsigned long next_issue_jiffies = 0;
+
 	set_freezable();
 
 	do {
@@ -1953,12 +1956,26 @@ static int issue_discard_thread(void *data)
 		if (!atomic_read(&dcc->discard_cmd_cnt))
 			continue;
 
+		// for delay
+
+		// if (dpolicy.type == DPOLICY_BG && next_issue_jiffies &&
+		// 	time_before(jiffies, next_issue_jiffies)) {
+		// 		wait_ms = jiffies_to_msecs(next_issue_jiffies - jiffies);
+		// 		if (!wait_ms)
+		// 				wait_ms = 1;
+		// 		continue;
+		// } // over
+		
 		sb_start_intwrite(sbi->sb);
 
 		issued = __issue_discard_cmd(sbi, &dpolicy);
 		f2fs_swod_sweep_timeout(sbi, jiffies);
 		if (issued > 0) {
 			__wait_all_discard_cmd(sbi, &dpolicy);
+			// for delay
+			// if (dpolicy.type == DPOLICY_BG)
+			// 	next_issue_jiffies = jiffies + msecs_to_jiffies(100);
+			//  over
 			wait_ms = dpolicy.min_interval;//50
 		} else if (issued == -1) {
 			wait_ms = f2fs_time_to_wait(sbi, DISCARD_TIME);

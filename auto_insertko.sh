@@ -6,6 +6,10 @@ insmod ef2fs.ko
 mkfs.f2fs -f /dev/nvme2n1
 #mount -t ef2fs  -o mode=lfs,nodiscard /dev/nvme2n1 /mnt
 mount -t ef2fs  -o mode=lfs /dev/nvme2n1 /mnt
+dmesg -C
 
-#echo 1 > /sys/fs/ef2fs/nvme2n1/swod_completion_enable
-#echo 1 > /sys/fs/ef2fs/nvme2n1/swod_enable
+# echo 1 > /sys/fs/ef2fs/nvme2n1/swod_enable
+# echo 1 > /sys/fs/ef2fs/nvme2n1/swod_completion_enable
+# echo 1 > /sys/fs/ef2fs/nvme2n1/swod_gc_bg_enable
+# echo 1 > /sys/fs/ef2fs/nvme2n1/swod_gc_fg_enable
+# echo 1 > /sys/fs/ef2fs/nvme2n1/swod_hbu_enable
